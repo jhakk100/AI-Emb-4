@@ -1,0 +1,13 @@
+{
+  "name": "ver1",
+  "fps": 5,
+  "resolution": [
+    320,
+    180
+  ],
+  "min_face_ratio": 0.15,
+  "front_tolerance": 0.3,
+  "center_range": 0.7,
+  "min_confidence": 0.8,
+  "hold_seconds": 0.8
+}
