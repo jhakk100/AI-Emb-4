@@ -1,4 +1,4 @@
-# Raspberry Pi 5 8GB / Windows: 같은 폴더의 ver1.json 설정으로 실행.
+# Raspberry Pi 5 8GB / Windows: set1.json 설정 사용. 조건 통과 시 clear 한 번 출력.
 # 필수 모듈: OpenCV(cv2). gpiozero.RGBLED 객체는 선택 사항.
 # prepare_camera(device=None, led=None) -> (열린 카메라, 고정 ROI 좌표).
 # 준비 중: 흰색 1초 켜짐/1초 꺼짐. 준비 완료: 노란색 지속.
@@ -53,7 +53,7 @@ try:
     VER1 = load_ver1()
 except RuntimeError as exc:
     if __name__ == '__main__':
-        print(f'안내: {exc}')
+        print(f'안내: {exc}', file=sys.stderr)
         raise SystemExit(1)
     raise
 
@@ -141,7 +141,9 @@ def nearby_faces(frame):
     if frame is None or not frame.size:
         raise RuntimeError('카메라 영상을 받을 수 없습니다.')
     detector = _detector()
-    detector.setInputSize((frame.shape[1], frame.shape[0]))
+    size = (frame.shape[1], frame.shape[0])
+    if detector.getInputSize() != size:
+        detector.setInputSize(size)
     _, faces = detector.detect(frame)
     return [] if faces is None else faces
 
@@ -208,7 +210,7 @@ def check_gate(face, points, settings):
 
 
 class FaceWatcher:
-    """UI에서 조절한 얼굴 크기·위치·특징점·유지 시간으로 촬영 준비 판단."""
+    """설정한 얼굴 크기·위치·특징점·유지 시간으로 촬영 준비 판단."""
     def __init__(self, settings=None):
         self.settings = settings or GateSettings()
         self.ready = False
@@ -240,7 +242,7 @@ class FaceWatcher:
         if self.ready:
             return
         height, width = shape
-        small = cv2.resize(frame, DETECT_SIZE)
+        small = frame if (width, height) == DETECT_SIZE else cv2.resize(frame, DETECT_SIZE)
         faces = nearby_faces(small)
         self.face = self.roi = None
         self.landmarks = []
@@ -298,8 +300,6 @@ def prepare_camera(device=None, led=None):
         if led is not None:
             led.blink(on_time=1, off_time=1, on_color=(1, 1, 1),
                       off_color=(0, 0, 0), background=True)
-        print(f'ver1 설정: {DETECT_SIZE[0]}x{DETECT_SIZE[1]}, {CHECK_FPS}fps')
-        print('LED: 흰색 1초 켜짐 / 1초 꺼짐 반복 : 눈·코·입 확인 대기 중')
         _detector()
         camera = open_usb_camera(device)
         scanner = FaceWatcher()
@@ -312,7 +312,7 @@ def prepare_camera(device=None, led=None):
             if scanner.ready:
                 if led is not None:
                     led.color = (1, 1, 0)
-                print('LED: 노란색 지속 : 눈·코·입 확인, 카메라 준비 완료')
+                print('clear', flush=True)
                 return camera, scanner.roi
             time.sleep(max(0, 1 / CHECK_FPS - (time.monotonic() - started)))
     except BaseException:
@@ -327,11 +327,11 @@ if __name__ == '__main__':
     camera = None
     try:
         camera, roi = prepare_camera()
-        print(f'다음 단계 전달 가능. 고정 ROI: {roi}')
     except RuntimeError as exc:
-        print(f'안내: {exc}')
+        print(f'안내: {exc}', file=sys.stderr)
+        raise SystemExit(1)
     except KeyboardInterrupt:
-        print('종료')
+        pass
     finally:
         if camera is not None:
             camera.release()
