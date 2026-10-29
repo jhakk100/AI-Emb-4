@@ -22,3 +22,5 @@
    **solution** 스윗 스팟을 찾는 목록 리스트를 추가해서 ver1.json에 저장함
 
 5. **problem** yunet이 상시 돌아갈 수 있음을 깨달음
+
+   **solution** window 환경에서 1-standby에서 메모리 사용량이 약 50mb이기 때문에 현재로선 유지하는게 나을듯 함
