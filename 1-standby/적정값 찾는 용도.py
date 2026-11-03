@@ -6,7 +6,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-spec = importlib.util.spec_from_file_location('standby', Path(__file__).with_name('1-standby.py'))
+spec = importlib.util.spec_from_file_location('standby', Path(__file__).with_name('1-standby-test.py'))
 standby = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(standby)
 

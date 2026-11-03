@@ -1,8 +1,7 @@
 # Raspberry Pi 5 8GB / Windows: set1.json 설정 사용. 조건 통과 시 clear 한 번 출력.
 # 필수 모듈: OpenCV(cv2). gpiozero.RGBLED 객체는 선택 사항.
-# prepare_camera(device=None, led=None) -> (열린 카메라, 고정 ROI 좌표).
+# prepare_camera(device=None, led=None) -> 카메라 종료 후 clear 출력, True 반환.
 # 준비 중: 흰색 1초 켜짐/1초 꺼짐. 준비 완료: 노란색 지속.
-# ROI=(x, y, 너비, 높이). 다음 단계에서 같은 영역을 자르고 camera.release() 호출.
 
 from dataclasses import dataclass
 from functools import cache
@@ -59,7 +58,6 @@ except RuntimeError as exc:
 
 CHECK_FPS = VER1['fps']
 DETECT_SIZE = VER1['resolution']
-FACE_MARGIN = 0.25  # 얼굴 상자 각 방향에 25% 여유
 MODEL_PATH = Path(__file__).with_name('models') / 'face_detection_yunet_2023mar.onnx'
 
 
@@ -163,13 +161,6 @@ def features_present(box, points):
             and max(eye1[1], eye2[1]) < nose[1] < min(mouth1[1], mouth2[1]))
 
 
-def face_crop(box, width, height):
-    x, y, w, h = box
-    left, top = max(0, round(x-w*FACE_MARGIN)), max(0, round(y-h*FACE_MARGIN))
-    right, bottom = min(width, round(x+w*(1+FACE_MARGIN))), min(height, round(y+h*(1+FACE_MARGIN)))
-    return left, top, right-left, bottom-top
-
-
 def overlap_ratio(a, b):
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
@@ -214,9 +205,6 @@ class FaceWatcher:
     def __init__(self, settings=None):
         self.settings = settings or GateSettings()
         self.ready = False
-        self.roi = None
-        self.face = None
-        self.landmarks = []
         self.shape = None
         self.reason = '얼굴 대기 중'
         self.valid_since = None
@@ -244,8 +232,6 @@ class FaceWatcher:
         height, width = shape
         small = frame if (width, height) == DETECT_SIZE else cv2.resize(frame, DETECT_SIZE)
         faces = nearby_faces(small)
-        self.face = self.roi = None
-        self.landmarks = []
         self.score = self.face_ratio = self.front_error = 0.0
         if len(faces) == 0:
             self.reason = '얼굴 대기 중'
@@ -270,14 +256,6 @@ class FaceWatcher:
         self.front_error = face_front_error(points)
         self.score = float(face[14])
         self.face_ratio = float(face[2]) / DETECT_SIZE[0]
-        sx, sy = width / DETECT_SIZE[0], height / DETECT_SIZE[1]
-        x, y, w, h = face[:4]
-        left, top = max(0, min(width-1, round(x*sx))), max(0, min(height-1, round(y*sy)))
-        right = min(width, max(left+1, round((x+w)*sx)))
-        bottom = min(height, max(top+1, round((y+h)*sy)))
-        self.face = (left, top, right-left, bottom-top)
-        self.roi = face_crop(self.face, width, height)
-        self.landmarks = [(round(px*sx), round(py*sy)) for px, py in points]
         if reason:
             self.reason = reason
             self.reset_hold()
@@ -309,29 +287,29 @@ def prepare_camera(device=None, led=None):
             if not ok:
                 raise RuntimeError('카메라 영상을 받을 수 없습니다.')
             scanner.update(frame)
+            del frame
             if scanner.ready:
-                if led is not None:
-                    led.color = (1, 1, 0)
-                print('clear', flush=True)
-                return camera, scanner.roi
+                break
             time.sleep(max(0, 1 / CHECK_FPS - (time.monotonic() - started)))
     except BaseException:
-        if camera is not None:
-            camera.release()
         if led is not None:
             led.off()
         raise
+    finally:
+        if camera is not None:
+            camera.release()
+
+    if led is not None:
+        led.color = (1, 1, 0)
+    print('clear', flush=True)
+    return True
 
 
 if __name__ == '__main__':
-    camera = None
     try:
-        camera, roi = prepare_camera()
+        prepare_camera()
     except RuntimeError as exc:
         print(f'안내: {exc}', file=sys.stderr)
         raise SystemExit(1)
     except KeyboardInterrupt:
         pass
-    finally:
-        if camera is not None:
-            camera.release()
