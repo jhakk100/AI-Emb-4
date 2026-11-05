@@ -6,13 +6,14 @@ from evaluation import (
     evaluate_thresholds,
     find_eer,
     print_results,
+    plot_far_frr,
 )
 
 
 def test_far():
     """Test False Acceptance Rate."""
 
-    # 다른 사람의 얼굴에서 나온 유사도라고 가정
+    # 다른 사람들의 유사도 점수
     impostor_scores = [
         0.20,
         0.25,
@@ -40,7 +41,7 @@ def test_far():
 def test_frr():
     """Test False Rejection Rate."""
 
-    # 등록된 사용자의 얼굴에서 나온 유사도라고 가정
+    # 본인 얼굴들의 유사도 점수
     genuine_scores = [
         0.70,
         0.75,
@@ -68,7 +69,7 @@ def test_frr():
 def test_threshold_evaluation():
     """Test FAR/FRR across multiple thresholds."""
 
-    # 정상 사용자 유사도
+    # 본인 얼굴 유사도 점수
     genuine_scores = [
         0.70,
         0.75,
@@ -77,7 +78,7 @@ def test_threshold_evaluation():
         0.90,
     ]
 
-    # 다른 사용자 유사도
+    # 다른 사람 얼굴 유사도 점수
     impostor_scores = [
         0.20,
         0.25,
@@ -86,6 +87,7 @@ def test_threshold_evaluation():
         0.40,
     ]
 
+    # 여러 threshold에서 성능 비교
     thresholds = [
         0.30,
         0.40,
@@ -110,10 +112,14 @@ def test_threshold_evaluation():
 
     print("\n결과: 성공\n")
 
+    # FAR / FRR 그래프 출력
+    plot_far_frr(results)
+
 
 def test_eer():
     """Test EER approximation."""
 
+    # EER 계산을 확인하기 위한 테스트 데이터
     genuine_scores = [
         0.40,
         0.50,
@@ -150,18 +156,31 @@ def test_eer():
 
     assert eer_result is not None
 
-    eer = (eer_result.far + eer_result.frr) / 2
+    eer = (
+        eer_result.far +
+        eer_result.frr
+    ) / 2
 
-    print(f"EER Threshold: {eer_result.threshold:.2f}")
-    print(f"EER: {eer:.2%}")
+    print(
+        f"EER Threshold: "
+        f"{eer_result.threshold:.2f}"
+    )
+
+    print(
+        f"EER: "
+        f"{eer:.2%}"
+    )
 
     print("결과: 성공\n")
 
 
 if __name__ == "__main__":
+
     test_far()
     test_frr()
     test_threshold_evaluation()
     test_eer()
 
-    print("===== 모든 성능 평가 테스트 완료 =====")
+    print(
+        "===== 모든 성능 평가 테스트 완료 ====="
+    )
