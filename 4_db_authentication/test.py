@@ -1,4 +1,3 @@
-```python
 """Tests for threshold-based face authentication performance evaluation."""
 
 from evaluation import (
@@ -166,4 +165,3 @@ if __name__ == "__main__":
     test_eer()
 
     print("===== 모든 성능 평가 테스트 완료 =====")
-```
