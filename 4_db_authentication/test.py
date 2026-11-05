@@ -1,92 +1,107 @@
-from database import (
-    initialize_database,
-    add_user,
-    delete_user
+"""Tests for face authentication performance evaluation."""
+
+from evaluation import (
+    calculate_far,
+    calculate_frr,
+    evaluate_thresholds,
+    print_results,
 )
 
-from similarity import cosine_similarity
-from authenticate import authenticate_face
 
+def test_far():
 
-def test_similarity():
-    """코사인 유사도 계산 테스트"""
+    impostor_scores = [
+        0.20,
+        0.25,
+        0.30,
+        0.35,
+        0.40,
+    ]
 
-    face1 = [1.0, 0.0, 0.0]
-    face2 = [1.0, 0.0, 0.0]
+    threshold = 0.45
 
-    similarity = cosine_similarity(face1, face2)
-
-    print("\n[테스트 1] 유사도 계산")
-    print("유사도:", similarity)
-
-    assert abs(similarity - 1.0) < 1e-6
-
-    print("결과: 성공")
-
-
-def test_authentication():
-    """얼굴 인증 기능 테스트"""
-
-    # 테스트용 가상 사용자 데이터
-    student_a = [1.0, 0.0, 0.0]
-    student_b = [0.0, 1.0, 0.0]
-
-    test_ids = ["test_student_A", "test_student_B"]
-
-    # 테스트 데이터 중복 방지
-    for user_id in test_ids:
-        delete_user(user_id)
-
-    # 테스트 사용자 등록
-    add_user(test_ids[0], student_a)
-    add_user(test_ids[1], student_b)
-
-    print("\n[테스트 2] 등록 사용자 인증")
-
-    result = authenticate_face(
-        current_embedding=student_a,
-        threshold=0.9
+    far = calculate_far(
+        impostor_scores,
+        threshold
     )
 
-    print("인증 결과:", result)
+    assert far == 0.0
 
-    assert result["authenticated"] is True
-    assert result["user_id"] == "test_student_A"
+    print("FAR test passed")
 
-    print("결과: 성공")
 
-    print("\n[테스트 3] 미등록 사용자 인증 거부")
+def test_frr():
 
-    unknown_face = [0.0, 0.0, 1.0]
+    genuine_scores = [
+        0.70,
+        0.75,
+        0.80,
+        0.85,
+        0.90,
+    ]
 
-    result = authenticate_face(
-        current_embedding=unknown_face,
-        threshold=0.9
+    threshold = 0.45
+
+    frr = calculate_frr(
+        genuine_scores,
+        threshold
     )
 
-    print("인증 결과:", result)
+    assert frr == 0.0
 
-    assert result["authenticated"] is False
-
-    print("결과: 성공")
-
-    # 테스트 데이터 삭제
-    for user_id in test_ids:
-        delete_user(user_id)
+    print("FRR test passed")
 
 
-def main():
-    """전체 테스트 실행"""
+def test_threshold_evaluation():
 
-    print("===== 얼굴 인증 시스템 테스트 시작 =====")
+    genuine_scores = [
+        0.70,
+        0.75,
+        0.80,
+        0.85,
+        0.90,
+    ]
 
-    initialize_database()
+    impostor_scores = [
+        0.20,
+        0.25,
+        0.30,
+        0.35,
+        0.40,
+    ]
 
-    test_similarity()
-    test_authentication()
+    thresholds = [
+        0.30,
+        0.40,
+        0.45,
+        0.50,
+        0.60,
+        0.70,
+    ]
 
-    print("\n===== 모든 테스트 완료 =====")
+    results = evaluate_thresholds(
+        genuine_scores,
+        impostor_scores,
+        thresholds
+    )
+
+    print()
+    print("Threshold performance evaluation")
+    print()
+
+    print_results(results)
+
+    assert len(results) == len(thresholds)
+
+    print()
+    print("Threshold evaluation test passed")
 
 
 if __name__ == "__main__":
-    main()
+
+    test_far()
+    test_frr()
+    test_threshold_evaluation()
+
+    print()
+    print("All tests passed.")
