@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import matplotlib.pyplot as plt
+
 
 @dataclass
 class EvaluationResult:
@@ -17,6 +19,7 @@ def calculate_far(impostor_scores, threshold):
     FAR:
         다른 사람의 얼굴을 등록된 사용자로 잘못 인증한 비율.
     """
+
     if not impostor_scores:
         return 0.0
 
@@ -35,6 +38,7 @@ def calculate_frr(genuine_scores, threshold):
     FRR:
         정상 사용자의 얼굴을 잘못 거부한 비율.
     """
+
     if not genuine_scores:
         return 0.0
 
@@ -134,3 +138,86 @@ def print_results(results):
         print("EER approximation")
         print(f"Threshold : {eer_result.threshold:.2f}")
         print(f"EER       : {eer * 100:.2f}%")
+
+
+def plot_far_frr(results):
+    """
+    Plot FAR and FRR according to threshold.
+
+    X-axis:
+        Threshold
+
+    Y-axis:
+        Error Rate (%)
+    """
+
+    if not results:
+        print("그래프로 표시할 결과가 없습니다.")
+        return
+
+    thresholds = [
+        result.threshold
+        for result in results
+    ]
+
+    far = [
+        result.far * 100
+        for result in results
+    ]
+
+    frr = [
+        result.frr * 100
+        for result in results
+    ]
+
+    plt.figure(figsize=(8, 5))
+
+    plt.plot(
+        thresholds,
+        far,
+        marker="o",
+        label="FAR"
+    )
+
+    plt.plot(
+        thresholds,
+        frr,
+        marker="o",
+        label="FRR"
+    )
+
+    # EER에 해당하는 지점 표시
+    eer_result = find_eer(results)
+
+    if eer_result is not None:
+        eer = (
+            eer_result.far +
+            eer_result.frr
+        ) / 2 * 100
+
+        plt.scatter(
+            eer_result.threshold,
+            eer,
+            s=100,
+            label="EER"
+        )
+
+        plt.annotate(
+            f"EER = {eer:.2f}%\nThreshold = {eer_result.threshold:.2f}",
+            (
+                eer_result.threshold,
+                eer
+            ),
+            xytext=(10, 10),
+            textcoords="offset points"
+        )
+
+    plt.xlabel("Threshold")
+    plt.ylabel("Error Rate (%)")
+    plt.title("FAR / FRR by Threshold")
+
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
