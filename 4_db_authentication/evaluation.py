@@ -1,19 +1,28 @@
+"""Threshold-based face authentication performance evaluation."""
 
-import math
+from dataclasses import dataclass
+
+
+@dataclass
+class EvaluationResult:
+    threshold: float
+    far: float
+    frr: float
 
 
 def calculate_far(impostor_scores, threshold):
     """
-    FAR(False Acceptance Rate) 계산
+    Calculate False Acceptance Rate (FAR).
 
-    등록되지 않은 사람을 잘못 인증한 비율
+    FAR:
+        다른 사람의 얼굴을 등록된 사용자로 잘못 인증한 비율.
     """
-
     if not impostor_scores:
-        raise ValueError("타인 비교 데이터가 없습니다.")
+        return 0.0
 
     false_accepts = sum(
-        score >= threshold for score in impostor_scores
+        score >= threshold
+        for score in impostor_scores
     )
 
     return false_accepts / len(impostor_scores)
@@ -21,126 +30,107 @@ def calculate_far(impostor_scores, threshold):
 
 def calculate_frr(genuine_scores, threshold):
     """
-    FRR(False Rejection Rate) 계산
+    Calculate False Rejection Rate (FRR).
 
-    등록된 사용자를 잘못 거부한 비율
+    FRR:
+        정상 사용자의 얼굴을 잘못 거부한 비율.
     """
-
     if not genuine_scores:
-        raise ValueError("본인 비교 데이터가 없습니다.")
+        return 0.0
 
     false_rejects = sum(
-        score < threshold for score in genuine_scores
+        score < threshold
+        for score in genuine_scores
     )
 
     return false_rejects / len(genuine_scores)
 
 
-def evaluate_authentication(genuine_scores, impostor_scores, threshold):
-    """
-    지정한 Threshold에서 FAR과 FRR을 계산합니다.
+def evaluate_threshold(
+    genuine_scores,
+    impostor_scores,
+    threshold
+):
+    """Evaluate FAR and FRR at one threshold."""
 
-    genuine_scores:
-        동일인의 얼굴 임베딩 비교 점수
+    far = calculate_far(
+        impostor_scores,
+        threshold
+    )
 
-    impostor_scores:
-        서로 다른 사람의 얼굴 임베딩 비교 점수
+    frr = calculate_frr(
+        genuine_scores,
+        threshold
+    )
 
-    threshold:
-        인증 기준값
-    """
-
-    validate_scores(genuine_scores)
-    validate_scores(impostor_scores)
-
-    far = calculate_far(impostor_scores, threshold)
-    frr = calculate_frr(genuine_scores, threshold)
-
-    return {
-        "threshold": threshold,
-        "FAR": far,
-        "FRR": frr
-    }
+    return EvaluationResult(
+        threshold=threshold,
+        far=far,
+        frr=frr
+    )
 
 
-def validate_scores(scores):
-    """유사도 데이터의 유효성을 검사합니다."""
+def evaluate_thresholds(
+    genuine_scores,
+    impostor_scores,
+    thresholds
+):
+    """Evaluate FAR and FRR over multiple thresholds."""
 
-    if not scores:
-        raise ValueError("평가할 유사도 데이터가 없습니다.")
+    results = []
 
-    for score in scores:
-        if not isinstance(score, (int, float)):
-            raise ValueError("유사도는 숫자여야 합니다.")
-
-        if not math.isfinite(score):
-            raise ValueError("유효하지 않은 유사도 값입니다.")
-
-
-def calculate_eer(genuine_scores, impostor_scores):
-    """
-    EER(Equal Error Rate)을 계산합니다.
-
-    FAR과 FRR의 차이가 가장 작은 Threshold를 선택합니다.
-    이 방식은 유한한 테스트 데이터에서 EER을 근사합니다.
-    """
-
-    validate_scores(genuine_scores)
-    validate_scores(impostor_scores)
-
-    all_scores = genuine_scores + impostor_scores
-
-    # 모든 유사도 점수를 정렬
-    sorted_scores = sorted(set(all_scores))
-
-    # Threshold 후보 생성
-    thresholds = [
-        sorted_scores[0] - 0.000001
-    ]
-
-    for i in range(len(sorted_scores) - 1):
-        midpoint = (
-            sorted_scores[i] + sorted_scores[i + 1]
-        ) / 2
-
-        thresholds.append(midpoint)
-
-    thresholds.append(sorted_scores[-1] + 0.000001)
-
-    best_result = None
-    min_difference = float("inf")
-
-    # 모든 Threshold에서 FAR과 FRR 비교
     for threshold in thresholds:
+        result = evaluate_threshold(
+            genuine_scores,
+            impostor_scores,
+            threshold
+        )
 
-        far = calculate_far(impostor_scores, threshold)
-        frr = calculate_frr(genuine_scores, threshold)
+        results.append(result)
 
-        difference = abs(far - frr)
-
-        if difference < min_difference:
-            min_difference = difference
-
-            best_result = {
-                "EER": (far + frr) / 2,
-                "threshold": threshold,
-                "FAR": far,
-                "FRR": frr
-            }
-
-    return best_result
+    return results
 
 
-def print_evaluation_result(result):
-    """평가 결과를 보기 쉽게 출력합니다."""
+def find_eer(results):
+    """
+    Find the threshold where FAR and FRR are closest.
 
-    print("\n========== Authentication Evaluation ==========")
+    This is a discrete approximation of EER.
+    """
 
-    print(f"Threshold : {result['threshold']:.4f}")
-    print(f"FAR       : {result['FAR'] * 100:.2f}%")
-    print(f"FRR       : {result['FRR'] * 100:.2f}%")
+    if not results:
+        return None
 
-    if "EER" in result:
-        print(f"EER       : {result['EER'] * 100:.2f}%")
+    return min(
+        results,
+        key=lambda result: abs(result.far - result.frr)
+    )
 
-    print("================================================")
+
+def print_results(results):
+    """Print threshold evaluation results."""
+
+    print(
+        f"{'Threshold':>10} "
+        f"{'FAR':>10} "
+        f"{'FRR':>10}"
+    )
+
+    print("-" * 34)
+
+    for result in results:
+        print(
+            f"{result.threshold:>10.2f} "
+            f"{result.far * 100:>9.2f}% "
+            f"{result.frr * 100:>9.2f}%"
+        )
+
+    eer_result = find_eer(results)
+
+    if eer_result is not None:
+        eer = (eer_result.far + eer_result.frr) / 2
+
+        print()
+        print("EER approximation")
+        print(f"Threshold : {eer_result.threshold:.2f}")
+        print(f"EER       : {eer * 100:.2f}%")
