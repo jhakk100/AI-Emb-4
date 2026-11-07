@@ -1,0 +1,13 @@
+# Recreate Python environments from requirements.txt.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local face records, embeddings, and runtime output.
+/임시통합/data/
+/임시통합/*.log
+
+# Download and verify models with 임시통합/models.py.
+/임시통합/models/*.onnx
+/임시통합/models/*.part
