@@ -24,6 +24,7 @@ import argparse
 import importlib.util
 import re
 import sys
+import threading
 import time
 
 STAGES_DIR = Path(__file__).resolve().parent / 'stages'
@@ -135,6 +136,10 @@ class Preview:
         if cv2.getWindowProperty(self.WINDOW, cv2.WND_PROP_VISIBLE) < 1:
             raise KeyboardInterrupt
 
+    def pump(self):
+        # 창 이벤트만 처리(5단계 처리 중에는 ESC로 끊지 않음 - 문 열림·잠금 처리를 끝까지 마침)
+        self.cv2.waitKey(1)
+
     def close(self):
         try:
             self.cv2.destroyWindow(self.WINDOW)
@@ -152,6 +157,29 @@ def set_wait_led(led, power_mode, last):
     else:
         led.color = (1, 1, 0)
     return power_mode
+
+
+def run_stage5(handler, auth, preview=None):
+    # 5단계는 문 열림 3초·버튼 대기 10초 동안 멈춰 있으므로, 미리보기 창이 있으면
+    # 별도 스레드에서 처리하고 그동안 창을 계속 갱신(Windows '응답 없음' 방지).
+    if preview is None:
+        return handler.handle(auth)
+    outcome = {}
+
+    def work():
+        try:
+            outcome['action'] = handler.handle(auth)
+        except BaseException as exc:  # 5단계 오류는 메인 스레드로 넘겨서 그대로 처리
+            outcome['error'] = exc
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        preview.pump()
+        worker.join(0.05)
+    if 'error' in outcome:
+        raise outcome['error']
+    return outcome['action']
 
 
 def wait_departure(camera, pipeline, seconds, preview=None):
@@ -216,7 +244,7 @@ def cmd_run(args):
                 ok = auth.status == stage5.AuthStatus.SUCCESS
                 preview.show(frame, result, wait_ms=300, color=(0, 200, 0) if ok else (0, 0, 255),
                              banner=f'{auth.status.value} {auth.user_id} score {auth.score:.3f}')
-            action = handler.handle(auth)                         # 5단계
+            action = run_stage5(handler, auth, preview)          # 5단계
             print(action.value, flush=True)
             led_mode = None
             camera.flush()

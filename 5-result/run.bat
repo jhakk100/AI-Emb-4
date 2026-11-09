@@ -6,4 +6,4 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 ".venv\Scripts\python.exe" integrate.py run --show --no-gpio --no-voice %*
-if errorlevel 1 pause
+pause

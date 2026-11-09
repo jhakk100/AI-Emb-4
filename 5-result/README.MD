@@ -11,10 +11,12 @@
 ## 실행 방법 (라즈베리파이)
 
 ```bash
-pip install -r 5-result/requirements.txt
-python 5-result/stages/models.py
-python 5-result/integrate.py enroll --name 이름
-python 5-result/integrate.py run
+sudo apt install -y python3-gpiozero python3-lgpio espeak-ng
+python3 -m venv --system-site-packages 5-result/.venv
+5-result/.venv/bin/pip install -r 5-result/requirements.txt
+5-result/.venv/bin/python 5-result/stages/models.py
+5-result/.venv/bin/python 5-result/integrate.py enroll --name 이름
+5-result/.venv/bin/python 5-result/integrate.py run
 ```
 핀 번호는 `set5.json`에서 배선에 맞게 수정
 
