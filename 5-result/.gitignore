@@ -1,8 +1,0 @@
-# 보안 로그·얼굴 사진·등록 DB는 개인정보라 깃에 올리지 않음
-logs/
-stages/data/
-# 가상환경, 캐시, 다운로드 모델(setup.bat이 받음)
-.venv/
-__pycache__/
-stages/models/*.onnx
-stages/models/*.part
