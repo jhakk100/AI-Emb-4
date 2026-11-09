@@ -153,15 +153,15 @@ class Stage5Cycle:
         """처리 중 화면 표시용: (LED 색 이름, 깜빡임 여부, 문구)"""
         _, name = self.led.describe()
         if name == 'green':
-            return 'green', False, '5단계 · 문 열림'
+            return 'green', False, '문이 열렸습니다.'
         if name == 'red':
-            return 'red', False, f'5단계 · 인증 실패 {self.handler.fail_count}/{self.settings["max_retries"]} · 다시 시도'
+            return 'red', False, f'인증 실패 ({self.handler.fail_count}/{self.settings["max_retries"]})'
         if name == 'red_blink':
             if self.manual_started is None:
                 self.manual_started = time.monotonic()
             left = max(0, self.settings['manual_timeout'] - (time.monotonic() - self.manual_started))
-            return 'red', True, f'5단계 · 3회 실패 · 수동 개방 버튼 대기 {left:.0f}초'
-        return 'yellow', False, '5단계 · 결과 처리 중'
+            return 'red', True, f'3회 실패 · 수동 개방 버튼 대기 {left:.0f}초'
+        return 'yellow', False, '결과 처리 중'
 
     def advance(self, now):
         """처리가 끝났으면 'retry' / 'reset' / 'finished' 중 하나, 아직이면 None."""

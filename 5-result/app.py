@@ -193,8 +193,8 @@ class FaceApp:
 
         outer = ttk.Frame(self.root, padding=22)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="얼굴인식 출입 · 1~5단계 통합", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(outer, text="실시간 검출·인식 / 5단계 결과 처리(문 열림·재시도·잠금·수동 개방) / 사용자 등록은 별도 탭").pack(anchor="w", pady=(4, 12))
+        ttk.Label(outer, text="내 얼굴 인식", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(outer, text="실시간 검출·인식 / 인증 성공 얼굴만 DB 저장 / 사용자 등록은 별도 탭").pack(anchor="w", pady=(4, 12))
         content = ttk.Frame(outer)
         content.pack(fill="both", expand=True)
         left, right = ttk.Frame(content), ttk.Frame(content, padding=(20, 0, 0, 0))
@@ -219,7 +219,7 @@ class FaceApp:
                         command=self.apply_mode).pack(side="left")
         ttk.Radiobutton(mode_row, text="1회 작동", variable=self.mode, value="once",
                         command=self.apply_mode).pack(side="right")
-        ttk.Label(right, text="1회: 결과 처리(열림·잠금) 후 중지").pack(anchor="w", pady=(0, 8))
+        ttk.Label(right, text="1회: 인증 → 열림 → 닫힘 후 중지").pack(anchor="w", pady=(0, 8))
         ttk.Label(right, text="카메라 연결", style="Result.TLabel").pack(anchor="w")
         row = ttk.Frame(right)
         row.pack(fill="x", pady=8)
@@ -250,7 +250,7 @@ class FaceApp:
         ttk.Button(storage_row, text="적용", command=self.apply_save_interval).pack(side="right")
         ttk.Label(auth_tab, textvariable=self.save_policy_text, wraplength=240).pack(anchor="w", pady=4)
         ttk.Label(auth_tab, textvariable=self.save_activity, wraplength=240).pack(anchor="w", pady=(0, 8))
-        ttk.Label(auth_tab, text="LED: 흰색 대기 / 노랑 조건 확인\n파랑 저장 / 보라 사용자 등록 / 회색 중지\n5단계: 초록 문 열림 / 빨강 인증 실패\n빨강 깜빡임 수동 개방 버튼 대기", wraplength=240).pack(anchor="w", pady=8)
+        ttk.Label(auth_tab, text="LED: 흰색 대기 / 노랑 조건 확인\n파랑 저장 / 초록 인증 / 빨강 미등록\n보라 사용자 등록 / 회색 중지\n빨강 깜빡임 수동 개방 버튼 대기", wraplength=240).pack(anchor="w", pady=8)
         ttk.Label(enroll_tab, text="이름을 지정한 경우에만 등록합니다.").pack(anchor="w")
         self.name_input = ttk.Entry(enroll_tab, textvariable=self.name, width=25, font=("맑은 고딕", 11))
         self.name_input.pack(fill="x", pady=8)
@@ -542,9 +542,14 @@ class FaceApp:
             if self.door.start(time.monotonic(), name, score, frame=frame,
                                auth_ms=getattr(telemetry, "process_ms", None)):
                 self.worker.pause_event.set()
-                self.door_message.set("인증 성공 → 5단계 처리" if name else "인증 실패 → 5단계 처리")
-                self.status.set("5단계 처리 중에는 인증·DB 저장을 일시 정지합니다.")
-                self.indicators.phase.set("현재 단계: 4단계 인증 완료 → 5단계 결과 처리")
+                if name:   # 성공 문구는 임시통합 그대로
+                    self.door_message.set("문이 열렸습니다.")
+                    self.status.set("3초 후 문이 닫힙니다. 열림 중에는 인증·DB 저장을 일시 정지합니다.")
+                    self.indicators.phase.set("현재 단계: 인증 완료 → 문 열림")
+                else:      # 실패 처리는 5단계에서 추가
+                    self.door_message.set("인증 실패")
+                    self.status.set("인증 실패 처리 중에는 인증·DB 저장을 일시 정지합니다.")
+                    self.indicators.phase.set("현재 단계: 인증 실패 → 5단계 결과 처리")
                 self.indicators.set_stage(5, "처리 중", "yellow")
                 self.register_button.configure(state="disabled")
         self._update_led()
@@ -572,10 +577,10 @@ class FaceApp:
             action = self.door.last_action
             handler = self.door.handler
             if action is not None:
-                messages = {"OPENED": ("문이 열렸다가 닫혔습니다. (OPENED)", "green"),
-                            "RETRY": ("인증 실패 · 다시 시도합니다. (RETRY)", "red"),
-                            "MANUAL_OPEN": ("수동 개방 버튼으로 열렸다가 닫혔습니다. (MANUAL_OPEN)", "green"),
-                            "LOCKED": ("3회 실패 · 잠금 유지 (LOCKED)", "red")}
+                messages = {"OPENED": ("문이 닫혔습니다.", "green"),
+                            "RETRY": (f"인증 실패 · 다시 시도합니다. ({handler.fail_count}/{handler.settings['max_retries']})", "red"),
+                            "MANUAL_OPEN": ("수동 개방 후 문이 닫혔습니다.", "green"),
+                            "LOCKED": ("3회 실패 · 잠금 유지", "red")}
                 text, color = messages[action.value]
                 self.door_message.set(text)
                 self.indicators.set_stage(5, f"{action.value} · 연속 실패 {handler.fail_count}/"
