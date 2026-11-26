@@ -1,4 +1,4 @@
-"""One camera, one authentication transaction, no unlock before challenge completion."""
+"""Stages 1-4: YuNet direction guidance, snapshot analysis, directional DB matching."""
 
 from dataclasses import dataclass, replace
 import math
@@ -9,8 +9,11 @@ import cv2
 from authenticate import authenticate_face
 from capture_control import ACTIVE_PROFILE, STANDBY_PROFILE
 from database import initialize_database
+from detection import crop_face
 from face_core import DEFAULT_THRESHOLD
-from liveness import FaceMeshEstimator, RotationChallenge, load_settings
+from guided_capture import (ARROWS, CaptureSample, GuidedCapture, compare_sample,
+                            load_guided_settings, normalized_mesh, yunet_pose)
+from liveness import FaceMeshEstimator, Pose
 from standby import FaceWatcher, overlap_ratio
 
 
@@ -26,7 +29,7 @@ class FrameResult:
     embedding_errors: int
     authenticated_name: str | None = None
     match_score: float | None = None
-    power_mode: str = "active"
+    power_mode: str = 'active'
     processing_size: tuple = (640, 480)
     target_fps: int = 20
     detection_boxes: list | None = None
@@ -34,57 +37,59 @@ class FrameResult:
     capture_fps: float | None = None
     authentication_attempted: bool = False
     liveness_passed: bool = False
-    liveness_step: str = ""
+    liveness_step: str = ''
     yaw: float | None = None
+    pitch: float | None = None
+    direction: str | None = None
+    arrow: str = ''
     session_id: int = 0
+    enrollment_count: int = 0
+    enrollment_completed: str | None = None
+    enrollment_error: str | None = None
 
 
 class FacePipeline:
-    def __init__(self, engine, watcher=None, store=None, source="camera:0",
-                 save_interval=1.0, progress=None, threshold=DEFAULT_THRESHOLD,
-                 start_in_standby=True, mesh=None, settings=None, purpose="authenticate"):
-        self.engine = engine
+    def __init__(self, engine, watcher=None, store=None, source='camera:0',
+                 save_interval=1., progress=None, threshold=DEFAULT_THRESHOLD,
+                 start_in_standby=True, mesh=None, settings=None, purpose='authenticate',
+                 enrollment_name=None, pose_estimator=yunet_pose, session_valid=None):
+        self.engine, self.mesh = engine, mesh
         self.watcher = watcher if watcher is not None else FaceWatcher()
         self.gate_settings = self.watcher.settings
-        self.mode = "standby" if start_in_standby else "active"
         self.store = store if store is not None else initialize_database()
-        self.source = source
         self.saved_count = self.store.count_observations()
-        self.save_interval = save_interval
-        self.last_saved_at = -float("inf")
-        self.progress = progress or (lambda text: None)
+        self.source, self.progress = source, progress or (lambda text: None)
+        self.save_interval = save_interval  # retained for existing UI; an auth pair is always atomic
         self._threshold = DEFAULT_THRESHOLD
-        self.threshold = threshold
-        self.settings = settings if settings is not None else load_settings()
-        self.mesh = mesh
-        self.challenge = None
+        self.settings = settings if settings is not None else load_guided_settings()
+        self.pose_estimator = pose_estimator
+        self.session_valid = session_valid or (lambda: True)
         self.session_id = 0
-        self.purpose = purpose
-        self._clear_attempt()
-        if purpose not in ("authenticate", "enroll", "preview", "departure"):
-            raise ValueError("잘못된 카메라 사용 목적")
-
-    def _clear_attempt(self):
-        self.challenge = None
-        self.identity = None
-        self.reference_embedding = None
-        self.last_identity_at = -float("inf")
-        self.terminal = False
-        self.active_started = None
+        self.set_purpose(purpose, enrollment_name=enrollment_name)
+        self.threshold = threshold
+        self.mode = 'standby' if start_in_standby else 'active'
 
     @property
     def profile(self):
-        return STANDBY_PROFILE if self.mode == "standby" else ACTIVE_PROFILE
+        return STANDBY_PROFILE if self.mode == 'standby' else ACTIVE_PROFILE
 
     def reset_standby(self):
-        self.mode = "standby"
+        self.mode = 'standby'
         self.watcher = FaceWatcher(self.gate_settings)
-        self._clear_attempt()
+        self.challenge = None
+        self.identity = self.reference_embedding = None
+        self.terminal = False
+        self.active_started = None
+        self.pose_origin = None
 
-    def set_purpose(self, purpose, session_id=None):
-        if purpose not in ("authenticate", "enroll", "preview", "departure"):
-            raise ValueError("잘못된 카메라 사용 목적")
-        self.purpose = purpose
+    def set_purpose(self, purpose, session_id=None, enrollment_name=None):
+        if purpose not in ('authenticate', 'enroll', 'preview', 'departure'):
+            raise ValueError('잘못된 카메라 사용 목적')
+        if purpose == 'enroll' and (not isinstance(enrollment_name, str)
+                                  or not 1 <= len(enrollment_name.strip()) <= 40):
+            raise ValueError('방향별 등록을 시작하려면 이름이 필요합니다.')
+        self.purpose, self.enrollment_name = purpose, enrollment_name
+        self.enrollment_requested_at = monotonic() if purpose == 'enroll' else None
         if session_id is not None:
             self.session_id = session_id
         self.reset_standby()
@@ -97,11 +102,10 @@ class FacePipeline:
     def threshold(self, value):
         value = float(value)
         if not math.isfinite(value) or not 0 <= value <= 1:
-            raise ValueError("인식 기준은 0~1 사이여야 합니다.")
+            raise ValueError('인식 기준은 0~1 사이여야 합니다.')
         if value != self._threshold:
             self._threshold = value
-            if hasattr(self, "challenge"):
-                self.reset_standby()
+            self.reset_standby()
 
     @property
     def save_interval(self):
@@ -111,143 +115,175 @@ class FacePipeline:
     def save_interval(self, value):
         value = float(value)
         if not math.isfinite(value) or value < 0:
-            raise ValueError("저장 간격은 0 이상의 유한한 숫자여야 합니다.")
+            raise ValueError('저장 간격은 0 이상의 유한한 숫자여야 합니다.')
         self._save_interval = value
 
-    def _result(self, profile, detections, status, **kwargs):
+    def _result(self, profile, detections, status):
         self.progress(status)
-        return FrameResult([], False, status, self.saved_count, 0, 0,
-                           len(detections), 0, power_mode=profile.name,
-                           processing_size=profile.size, target_fps=profile.fps,
-                           detection_boxes=[tuple(float(v) for v in row[:4]) for row in detections],
-                           session_id=self.session_id, **kwargs)
+        result = FrameResult([], False, status, self.saved_count, 0, 0, len(detections), 0,
+            power_mode=profile.name, processing_size=profile.size, target_fps=profile.fps,
+            detection_boxes=[tuple(float(v) for v in row[:4]) for row in detections],
+            session_id=self.session_id)
+        if self.challenge:
+            result.direction = self.challenge.target
+            result.arrow = ARROWS.get(result.direction, '')
+            result.liveness_step = self.challenge.prompt
+            if self.purpose == 'enroll':
+                result.enrollment_count = len(self.challenge.samples)
+        return result
 
     def _failure(self, profile, detections, message, score=None):
         self.terminal = True
         result = self._result(profile, detections, message)
-        result.ready = True
-        result.match_score = score
-        result.authentication_attempted = True
+        if self.purpose == 'enroll':
+            result.enrollment_error = message
+        else:
+            result.ready = result.authentication_attempted = True
+            result.match_score = score
         return result
 
-    def _analyze(self, frame, detections):
-        faces = self.engine.analyze(frame, detections)
+    def _analyze(self, snapshot, detections):
+        faces = self.engine.analyze(snapshot, detections)
         if len(faces) != 1 or faces[0].sharpness < 50 or min(faces[0].box[2:]) < 90:
-            raise ValueError("얼굴이 작거나 흐립니다. 가까이에서 잠시 멈춰주세요.")
+            raise ValueError('얼굴이 작거나 흐립니다. 가까이에서 잠시 멈춰주세요.')
         return faces[0]
 
+    def _snapshot(self, frame, detection, pose, now):
+        # Freeze first; neither feature model ever reads a later camera frame.
+        snapshot = frame.copy()
+        face = self._analyze(snapshot, [detection])
+        estimate = self.mesh.observe(snapshot, now)
+        if estimate is None or overlap_ratio(tuple(detection[:4]), estimate.box) < .25:
+            raise ValueError('촬영 사진의 Mesh와 YuNet 얼굴이 일치하지 않습니다.')
+        size = snapshot.shape[1], snapshot.shape[0]
+        geometry = normalized_mesh(estimate.landmarks, size)
+        ok, jpeg = cv2.imencode('.jpg', crop_face(snapshot, detection[:4]))
+        if not ok:
+            raise ValueError('사진 인코딩 실패')
+        index = sum(s.direction == self.challenge.target for s in self.challenge.samples)
+        return face, CaptureSample(self.challenge.target, index, now, face.embedding.copy(),
+            estimate.landmarks.copy(), geometry, pose, size, detection.copy(), jpeg.tobytes())
+
     def process(self, frame):
-        profile = self.profile
-        if self.terminal:
-            return self._result(profile, [], "결과 처리 대기")
+        profile, now = self.profile, monotonic()
+        if self.terminal or not self.session_valid():
+            return self._result(profile, [], '결과 처리 또는 새 세션 대기')
+        if (self.purpose == 'enroll' and self.enrollment_requested_at is not None
+                and now-self.enrollment_requested_at >= self.settings.enroll_timeout):
+            return self._failure(profile, [], '등록 촬영 시간 초과 · 다시 시작하세요')
         detections = self.engine.detect(frame, size=profile.size)
-        now = monotonic()
-        if self.purpose == "departure":
-            return self._result(profile, detections, "화면에서 벗어나 주세요")
-        if self.mode == "standby":
+        if self.purpose == 'departure':
+            return self._result(profile, detections, '화면에서 벗어나 주세요')
+        if self.mode == 'standby':
             if len(detections) == 1:
                 self.watcher.update(frame, detections)
             else:
                 self.watcher.ready = False
                 self.watcher.reset_hold()
-                self.watcher.reason = "얼굴 대기 중" if not len(detections) else "얼굴은 한 명만 보여주세요"
+                self.watcher.reason = '얼굴 대기 중' if not len(detections) else '얼굴은 한 명만 보여주세요'
             reason = self.watcher.reason
             if self.watcher.ready:
-                self.mode = "active"
+                self.mode = 'active'
                 self.active_started = now
                 self.watcher = FaceWatcher(replace(self.gate_settings, hold_seconds=0))
-                reason = "준비 완료 · 다음 프레임부터 활성 검사"
+                reason = '촬영 준비 완료 · 활성 해상도로 전환'
             return self._result(profile, detections, reason)
-        if self.active_started is None:
-            self.active_started = now
         if len(detections) != 1:
             if self.challenge:
-                return self._failure(profile, detections, "얼굴 소실 또는 여러 얼굴 · 검사 실패")
+                return self._failure(profile, detections, '얼굴 소실 또는 여러 얼굴 · 다시 시작하세요')
             self.reset_standby()
-            return self._result(profile, detections, "얼굴은 한 명만 보여주세요")
-        if self.challenge is None:
-            self.watcher.update(frame, detections)
-            if not self.watcher.ready:
-                self.reset_standby()
-                return self._result(profile, detections, "정면에서 촬영 준비를 다시 확인합니다")
+            return self._result(profile, detections, '얼굴은 한 명만 보여주세요')
         try:
-            if self.purpose in ("preview", "enroll"):
-                face = self._analyze(frame, detections)
-                result = self._result(profile, detections, "등록 준비 완료 · 선명한 정면 얼굴")
-                result.faces, result.ready = [face], True
-                return result
-            if self.identity is None:
-                self.store.refresh()
-                if not self.store.people:
-                    face = self._analyze(frame, detections)
-                    result = self._result(profile, detections, "등록된 사용자가 없습니다 · 사용자 등록 탭을 열어주세요")
-                    result.faces, result.ready = [face], True
-                    return result
-            # Check deadlines before model work; no stale success can survive a long frame gap.
-            if self.challenge and (now - self.challenge.started >= self.settings.total_timeout
-                    or now - self.challenge.step_started >= self.settings.step_timeout):
-                return self._failure(profile, detections, "동작 검사 시간 초과")
-            if now - self.active_started >= self.settings.total_timeout:
-                return self._failure(profile, detections, "활성 인증 시간 초과")
-            if self.mesh is None:
-                self.mesh = FaceMeshEstimator(self.progress)
-                # Model startup/download is outside the user's response window.
-                now = monotonic()
+            if self.active_started is None:
                 self.active_started = now
-            pose = self.mesh.observe(frame, now)
-            if pose is None or overlap_ratio(tuple(detections[0][:4]), pose.box) < 0.25:
-                if self.challenge:
-                    return self._failure(profile, detections, "Face Mesh 추적 중단 또는 얼굴 불일치")
-                return self._result(profile, detections, "얼굴 특징점을 확인하고 있습니다")
-            final_front = self.challenge is not None and self.challenge.index == len(self.challenge.steps) - 1
-            due = self.identity is None or final_front or now - self.last_identity_at >= self.settings.embedding_interval
-            face, score = None, None
-            if due:
-                face = self._analyze(frame, detections)
-                self.store.refresh()
-                name, score = authenticate_face(self.store, face.embedding, self.threshold)
-                if name is None:
-                    return self._failure(profile, detections, "등록된 얼굴과 일치하지 않습니다", score)
-                if self.identity is not None and (name != self.identity or
-                        float(self.reference_embedding @ face.embedding) < self.threshold):
-                    return self._failure(profile, detections, "검사 중 얼굴이 변경되었습니다", score)
-                if self.identity is None:
-                    self.identity, self.reference_embedding = name, face.embedding.copy()
-                self.last_identity_at = now
+            if self.challenge and self.challenge.timed_out(now):
+                return self._failure(profile, detections, '방향 촬영 시간 초과 · 다시 시작하세요')
+            if (self.challenge is None and self.purpose == 'authenticate'
+                    and now-self.active_started >= self.settings.auth_timeout):
+                return self._failure(profile, detections, '본인 확인 사진 품질 검사 시간 초과')
             if self.challenge is None:
-                self.challenge = RotationChallenge(self.settings, now)
-            self.challenge.update(pose, now)
+                self.watcher.update(frame, detections)
+                if not self.watcher.ready:
+                    self.reset_standby()
+                    return self._result(profile, detections, '정면에서 촬영 준비를 다시 확인합니다')
+                if self.purpose == 'preview':
+                    result = self._result(profile, detections, '등록 준비 완료 · 이름을 입력하고 등록하세요')
+                    result.faces, result.ready = [self._analyze(frame, detections)], True
+                    return result
+                if self.purpose == 'authenticate':
+                    self.store.refresh()
+                    face = self._analyze(frame.copy(), detections)
+                    if not self.store.people:
+                        result = self._result(profile, detections, '등록된 사용자가 없습니다 · 사용자 등록 탭을 열어주세요')
+                        result.faces, result.ready = [face], True
+                        return result
+                    name, score = authenticate_face(self.store, face.embedding, self.threshold)
+                    if name is None:
+                        return self._failure(profile, detections, '등록된 얼굴과 일치하지 않습니다', score)
+                    if not self.store.has_directional_profile(name):
+                        return self._failure(profile, detections, '정면·상·하·좌·우 3장씩 재등록이 필요합니다', score)
+                    self.identity, self.reference_embedding = name, face.embedding.copy()
+                # Five-point PnP has person/camera-dependent pitch bias. Calibrate at the
+                # YuNet frontal gate; guide subsequent rotations relative to this pose.
+                baseline = self.pose_estimator(detections[0], (frame.shape[1], frame.shape[0]))
+                self.pose_origin = baseline.yaw, baseline.pitch
+                # Prepare model once, before starting user-facing direction deadlines.
+                if self.mesh is None:
+                    self.mesh = FaceMeshEstimator(self.progress)
+                    now = monotonic()
+                self.challenge = GuidedCapture(self.purpose, self.settings, now)
+            raw_pose = self.pose_estimator(detections[0], (frame.shape[1], frame.shape[0]))
+            pose = Pose(raw_pose.yaw-self.pose_origin[0], raw_pose.pitch-self.pose_origin[1],
+                        raw_pose.roll, raw_pose.box)
+            due = self.challenge.candidate_due(pose, now)
             if self.challenge.failure:
                 return self._failure(profile, detections, self.challenge.failure)
+            if not due:
+                result = self._result(profile, detections, self.challenge.prompt)
+                result.yaw, result.pitch = pose.yaw, pose.pitch
+                return result
+            face, sample = self._snapshot(frame, detections[0], pose, now)
+            if self.reference_embedding is not None and float(self.reference_embedding @ face.embedding) < self.threshold:
+                return self._failure(profile, detections, '촬영 도중 얼굴이 변경되었습니다')
+            if self.reference_embedding is None:
+                self.reference_embedding = face.embedding.copy()
+            proof = None
+            if self.purpose == 'authenticate':
+                proof = compare_sample(sample, self.store.directional_samples(self.identity, sample.direction),
+                                       self.threshold, self.settings)
+                if proof is None:
+                    return self._failure(profile, detections, '해당 방향의 임베딩 또는 Mesh 형상 불일치')
+            self.challenge.accept(sample, now)
             result = self._result(profile, detections, self.challenge.prompt)
-            result.yaw, result.liveness_step = pose.yaw, self.challenge.prompt
+            result.faces, result.yaw, result.pitch = [face], pose.yaw, pose.pitch
             if not self.challenge.complete:
                 return result
-            # Completion happens only on a freshly matched, frontal frame.
-            if face is None:
-                return self._failure(profile, detections, "최종 본인 확인 누락")
-            result.ready, result.authentication_attempted, result.liveness_passed = True, True, True
-            result.faces, result.authenticated_name, result.match_score = [face], self.identity, score
-            if now - self.last_saved_at >= self.save_interval:
-                sample_id = self.store.record_authenticated(frame, detections[0], face.embedding,
-                    self.source, gate_passed=True, threshold=self.threshold)
-                if sample_id is None:
-                    return self._failure(profile, detections, "최종 등록 정보가 변경되었습니다")
-                result.saved_this_frame = 1
-                self.saved_count += 1
-                self.last_saved_at = now
-            result.saved_count = self.saved_count
-            result.status = "본인 확인 및 무작위 동작 검사 통과"
+            if not self.session_valid():
+                self.terminal = True
+                return self._result(profile, detections, '등록 또는 인증이 취소되었습니다')
+            if self.purpose == 'enroll':
+                self.store.enroll_directional(self.enrollment_name, self.challenge.samples, self.settings)
+                result.enrollment_completed = self.enrollment_name
+                result.enrollment_count = 15
+                result.status = '5방향 15장 등록 완료 · 사진·Mesh·임베딩 DB 저장'
+            else:
+                proofs = self.store.record_directional_pair(self.identity, self.challenge.samples,
+                                                          self.source, self.threshold, self.settings)
+                if proofs is None:
+                    return self._failure(profile, detections, '최종 DB 비교 실패 · 등록 정보 변경 또는 형상 불일치')
+                result.ready = result.authentication_attempted = result.liveness_passed = True
+                result.authenticated_name = self.identity
+                result.match_score = min(p[0] for p in proofs)
+                self.saved_count += 2
+                result.saved_count, result.saved_this_frame = self.saved_count, 2
+                result.status = '무작위 두 방향의 사진·임베딩·Mesh 비교 통과'
             self.terminal = True
             return result
         except (cv2.error, ValueError, IndexError) as exc:
-            if self.challenge:
-                result = self._failure(profile, detections, f"검사 실패: {exc}")
-            else:
-                result = self._result(profile, detections, f"영상 품질 확인: {exc}")
-                if now - self.active_started >= self.settings.total_timeout:
-                    result = self._failure(profile, detections, "영상 품질 확인 시간 초과")
+            result = self._result(profile, detections, f'촬영 사진 확인: {exc}')
             result.embedding_errors = 1
+            if self.challenge:
+                self.challenge.hold_started, self.challenge.frames = None, 0
             return result
 
     def close(self):

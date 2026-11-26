@@ -177,6 +177,27 @@ class GuiSessionTests(unittest.TestCase):
         self.assertEqual(self.ui.worker.commands.get_nowait(), ('threshold', .6))
         self.assertEqual(self.ui.worker.commands.get_nowait()[0], 'purpose')
 
+    def test_guidance_draws_native_arrows_for_each_direction(self):
+        frame = np.zeros((180, 320, 3), dtype=np.uint8)
+        for direction in ('front', 'up', 'down', 'left', 'right'):
+            telemetry = result()
+            telemetry.direction = direction
+            telemetry.arrow = direction
+            self.ui._handle_frame(frame, [], 1., 5., 'direction prompt', False, 0, telemetry)
+            types = [self.ui.canvas.type(item) for item in self.ui.canvas.find_all()]
+            self.assertIn('oval' if direction == 'front' else 'line', types)
+
+    def test_registration_sends_name_to_worker_instead_of_collecting_on_ui(self):
+        import time
+        self.ui.gate_ready = True
+        self.ui.last_frame_at = time.monotonic()
+        self.ui.name.set('new')
+        self.ui.register()
+        command, payload = self.ui.worker.commands.get_nowait()
+        self.assertEqual(command, 'purpose')
+        self.assertEqual(payload[0], 'enroll')
+        self.assertEqual(payload[2], 'new')
+
 
 if __name__ == '__main__':
     unittest.main()

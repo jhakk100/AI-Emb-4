@@ -13,7 +13,7 @@
 # 준비: 5-result/setup.bat (가상환경 .venv + 패키지 + 모델 다운로드).
 #       Pi: pip install -r 5-result/requirements.txt 후 python 5-result/stages/models.py
 # 사용법 (레포 최상위에서, 5-result/.venv의 python):
-#   python 5-result/integrate.py enroll --name 홍길동 [--show]   1단계 통과 얼굴 15샘플로 등록 (enroll.bat)
+#   python 5-result/integrate.py enroll --name 홍길동 [--show]   정면·상·하·좌·우 3장씩 DB 등록
 #   python 5-result/integrate.py users                          등록 목록
 #   python 5-result/integrate.py delete --name 홍길동            등록 삭제
 #   python 5-result/integrate.py run [--show] [--once] [--no-gpio] [--no-voice] [--camera 0]
@@ -67,10 +67,11 @@ class Stages:
         self.store = database.initialize_database()
         self.threshold = face_core.DEFAULT_THRESHOLD if threshold is None else threshold
 
-    def new_pipeline(self, source, purpose="authenticate"):
-        # save_interval: 인증 성공 얼굴 crop을 DB observations에 남기는 최소 간격(임시통합 기본값 1초)
+    def new_pipeline(self, source, purpose="authenticate", enrollment_name=None):
+        # The legacy interval argument remains compatible; a successful auth pair is stored atomically.
         return self.pipeline_module.FacePipeline(self.engine, store=self.store, source=source,
-                                                 save_interval=1.0, threshold=self.threshold, purpose=purpose)
+                                                 save_interval=1.0, threshold=self.threshold, purpose=purpose,
+                                                 enrollment_name=enrollment_name)
 
 
 class Camera:
@@ -132,6 +133,17 @@ class Preview:
         text = banner or f'{result.power_mode} {result.processing_size[0]}x{result.processing_size[1]} | faces {result.detected_count}'
         cv2.rectangle(image, (0, 0), (image.shape[1], 24), (0, 0, 0), -1)
         cv2.putText(image, text, (5, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1, cv2.LINE_AA)
+        direction = getattr(result, 'direction', None)
+        if direction:
+            cx = image.shape[1] // 2
+            offsets = {'up': (0, -25), 'down': (0, 25), 'left': (-25, 0), 'right': (25, 0)}
+            cv2.rectangle(image, (cx-80, 30), (cx+80, 130), (0, 0, 0), -1)
+            if direction in offsets:
+                dx, dy = offsets[direction]
+                cv2.arrowedLine(image, (cx-dx, 75-dy), (cx+dx, 75+dy), (0, 255, 255), 4, tipLength=.3)
+            else:
+                cv2.circle(image, (cx, 75), 15, (0, 255, 255), 3)
+            cv2.putText(image, direction.upper(), (cx-35, 120), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1)
         cv2.imshow(self.WINDOW, image)
         if cv2.waitKey(wait_ms) & 0xFF in (27, ord('q'), ord('Q')):
             raise KeyboardInterrupt
@@ -283,37 +295,36 @@ def cmd_run(args):
 
 
 def cmd_enroll(args):
-    # 임시통합 app.py 등록과 같은 규칙: 1단계 통과 얼굴만, 얼굴 1명, 크기·선명도 검사, 15샘플 평균
+    # The worker/pipeline owns all 15 snapshots and commits a complete profile atomically.
     stages = Stages(args.threshold)
-    enrollment = stages.face_core.Enrollment(args.name)
     target = stages.face_core.REGISTRATION_SAMPLES
     camera = preview = pipeline = None
     last_status = None
     try:
         camera = Camera(stages, args.camera, flip=not args.no_flip)
-        pipeline = stages.new_pipeline(f'camera:{args.camera}', purpose='enroll')
+        pipeline = stages.new_pipeline(f'camera:{args.camera}', purpose='enroll', enrollment_name=args.name)
         preview = Preview(stages.cv2) if args.show else None
-        print(f'등록: {args.name} - 화면 중앙에서 정면을 보고 고개를 조금씩 움직여 주세요 ({target}샘플, 60초)',
+        print(f'등록: {args.name} - 정면·상·하·좌·우마다 3장씩, 총 {target}장',
               file=sys.stderr, flush=True)
-        while len(enrollment.samples) < target:
+        while True:
             started = time.monotonic()
-            if started - enrollment.started > 60:
-                raise RuntimeError('60초 안에 등록을 마치지 못했습니다. 밝은 곳에서 다시 시도하세요.')
             profile = pipeline.profile
             frame = camera.read(profile)
             if frame is None:
                 time.sleep(0.05)
                 continue
             result = pipeline.process(frame)
-            status = enrollment.accept(result.faces if result.ready else [], time.monotonic())
-            if not result.ready:
-                status = result.status
+            status = result.status
             kind = re.sub(r'[\d.]+/[\d.]+초', '', status)  # 유지 시간 숫자만 바뀌면 다시 출력 안 함
             if kind != last_status:
                 last_status = kind
                 print(f'  {status}', file=sys.stderr, flush=True)
+            if result.enrollment_error:
+                raise RuntimeError(result.enrollment_error)
+            if result.enrollment_completed:
+                break
             if preview is not None:
-                preview.show(frame, result, banner=f'ENROLL {len(enrollment.samples)}/{target}', color=(255, 0, 255))
+                preview.show(frame, result, banner=f'ENROLL {result.enrollment_count}/{target}', color=(255, 0, 255))
             time.sleep(stages.capture_control.frame_delay(started, time.monotonic(), profile.fps))
     finally:
         with ExitStack() as cleanup:
@@ -323,7 +334,6 @@ def cmd_enroll(args):
                 cleanup.callback(pipeline.close)
             if camera is not None:
                 cleanup.callback(camera.release)
-    stages.database.add_user(stages.store, args.name, enrollment.samples)
     print(f'등록 완료: {args.name}', flush=True)
 
 
@@ -350,7 +360,7 @@ def parser():
     run.add_argument('--no-gpio', action='store_true', help='GPIO 장치 생성 안 함(노트북)')
     run.add_argument('--no-voice', action='store_true', help='음성 안내 끔')
     run.add_argument('--departure', type=float, default=1.0, help='다음 사람 대기 전 화면 비움 시간(초)')
-    enroll = commands.add_parser('enroll', help='1단계 통과 얼굴 15샘플로 등록')
+    enroll = commands.add_parser('enroll', help='정면·상·하·좌·우 3장씩 사진·Mesh·임베딩 등록')
     enroll.add_argument('--name', required=True)
     commands.add_parser('users', help='등록 목록')
     delete = commands.add_parser('delete', help='등록 삭제')

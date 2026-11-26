@@ -1,8 +1,7 @@
-"""1~5단계 통합 화면 (임시통합 app.py 기반). run.bat 또는 python app.py로 실행.
+"""Shared-camera UI: five directions x three registration photos, two-photo authentication.
 
-임시통합의 1~4단계 화면·등록·기록 기능은 그대로 두고, 인증 결과 처리(문 열림 흉내 door_cycle)를
-5단계(5-result.py)로 바꿨다: 성공 시 문 열림, 실패 시 재시도, 3회 실패 시 경보·수동 개방 버튼·잠금,
-보안 로그(logs/security_log.csv)와 결과 사진(logs/snapshots/) 저장. 1~4단계 모듈은 stages/에 있다.
+YuNet guides movement; captured photos run SFace and Face Mesh in the camera worker.
+Stages 1-4 live in stages/. Existing stage-5 result handling remains in Stage5Cycle.
 """
 
 import argparse
@@ -24,13 +23,14 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "stages"))  # 1~4단계 모듈(임시통합에서 복사)
 
-from face_core import DEFAULT_THRESHOLD, Enrollment, FaceEngine, REGISTRATION_SAMPLES, open_camera
+from face_core import DEFAULT_THRESHOLD, FaceEngine, REGISTRATION_SAMPLES, open_camera
 from models import ensure_models
 from authenticate import authenticate_face
-from database import add_user, delete_user, initialize_database
+from database import delete_user, initialize_database
 from stage5_cycle import Stage5Cycle
 from capture_control import STANDBY_PROFILE, configure_capture, frame_delay, prepare_frame
 from pipeline import FacePipeline
+from guided_capture import LABELS
 from status_panel import StatusPanel
 
 
@@ -45,6 +45,7 @@ class CameraWorker(threading.Thread):
         self.save_interval = save_interval
         self.threshold = threshold
         self.purpose, self.session_id = purpose, session_id
+        self.requested_session = session_id
 
     def _stage(self, text):
         try:
@@ -66,7 +67,9 @@ class CameraWorker(threading.Thread):
             engine = FaceEngine(*paths)
             pipeline = FacePipeline(engine, source=f"camera:{self.index}",
                                     save_interval=self.save_interval, progress=self._stage,
-                                    threshold=self.threshold, purpose=self.purpose)
+                                    threshold=self.threshold, purpose=self.purpose,
+                                    session_valid=lambda: self.requested_session == pipeline.session_id
+                                        and not self.stop_event.is_set())
             pipeline.session_id = self.session_id
             self.events.put(("status", f"카메라 {self.index} 연결 중…"))
             configured_profile = pipeline.profile
@@ -87,8 +90,8 @@ class CameraWorker(threading.Thread):
                     elif setting == "reset_gate":
                         pipeline.reset_standby()
                     elif setting == "purpose":
-                        purpose, session_id = value
-                        pipeline.set_purpose(purpose, session_id)
+                        purpose, session_id, *name = value
+                        pipeline.set_purpose(purpose, session_id, enrollment_name=name[0] if name else None)
                         self.pause_event.clear()
                 if self.pause_event.is_set():
                     self.stop_event.wait(.05)
@@ -137,7 +140,7 @@ class CameraWorker(threading.Thread):
                     except Empty:
                         pass
                     self.frames.put_nowait(packet)
-                if result.authentication_attempted:
+                if result.authentication_attempted or result.enrollment_completed or result.enrollment_error:
                     # Exactly one terminal packet; never overwrite it with a later frame.
                     self.pause_event.set()
                 self.stop_event.wait(frame_delay(started, time.monotonic(), profile.fps))
@@ -172,7 +175,7 @@ class FaceApp:
         self.crop_photo = None
         self.applied_save_interval = 1.0
         self.save_interval = tk.StringVar(value="1.0")
-        self.save_policy_text = tk.StringVar(value="인증 성공 얼굴만 1초마다 저장")
+        self.save_policy_text = tk.StringVar(value="두 방향이 모두 통과하면 사진 2장을 함께 저장")
         self.save_activity = tk.StringVar(value="DB 저장 대기")
         self.last_saved_at = 0
         self.last_matched = False
@@ -263,14 +266,8 @@ class FaceApp:
         tabs.add(auth_tab, text="인식·기록")
         tabs.add(enroll_tab, text="사용자 등록")
         tabs.add(history_tab, text="수집 기록")
-        ttk.Label(auth_tab, text="정면 본인 확인 후 화면 안내대로\n고개를 돌리고 정면으로 돌아오세요.\n무작위 동작과 최종 본인 확인을\n모두 통과해야 출입·저장합니다.").pack(anchor="w", pady=8)
+        ttk.Label(auth_tab, text="정면 본인 확인 후 화살표가 가리키는\n무작위 두 방향을 바라보세요.\n두 사진의 임베딩·Mesh가 등록 정보와\n모두 일치해야 출입·저장합니다.").pack(anchor="w", pady=8)
         ttk.Label(auth_tab, textvariable=self.saved_text, style="Result.TLabel").pack(anchor="w", pady=8)
-        ttk.Label(auth_tab, text="DB 저장 간격 (초)").pack(anchor="w", pady=(8, 4))
-        storage_row = ttk.Frame(auth_tab)
-        storage_row.pack(fill="x")
-        ttk.Spinbox(storage_row, from_=0.2, to=60, increment=0.5, width=7,
-                    textvariable=self.save_interval).pack(side="left")
-        ttk.Button(storage_row, text="적용", command=self.apply_save_interval).pack(side="right")
         ttk.Label(auth_tab, textvariable=self.save_policy_text, wraplength=240).pack(anchor="w", pady=4)
         ttk.Label(auth_tab, textvariable=self.save_activity, wraplength=240).pack(anchor="w", pady=(0, 8))
         ttk.Label(auth_tab, text="LED: 흰색 대기 / 노랑 조건 확인\n파랑 저장 / 초록 인증 / 빨강 미등록\n보라 사용자 등록 / 회색 중지\n빨강 깜빡임 수동 개방 버튼 대기", wraplength=240).pack(anchor="w", pady=8)
@@ -283,7 +280,7 @@ class FaceApp:
         self.cancel_button.pack(fill="x", pady=4)
         self.progress = ttk.Progressbar(enroll_tab, maximum=REGISTRATION_SAMPLES)
         self.progress.pack(fill="x", pady=(0, 6))
-        ttk.Label(enroll_tab, text="얼굴 한 명 · 선명한 샘플 15개\n정면을 유지하며 조금씩 움직여주세요.").pack(anchor="w")
+        ttk.Label(enroll_tab, text="정면·상·하·좌·우 각각 3장, 총 15장\n화살표 방향으로 고개를 돌려 멈추세요.\n촬영한 사진의 Mesh·임베딩을 저장합니다.").pack(anchor="w")
 
         ttk.Label(enroll_tab, text="등록된 얼굴", style="Result.TLabel").pack(anchor="w", pady=(12, 6))
         self.people = tk.Listbox(enroll_tab, height=3, font=("맑은 고딕", 11), exportselection=False)
@@ -436,7 +433,7 @@ class FaceApp:
             return
         if name in self.store.people and not messagebox.askyesno("다시 등록", f"‘{name}’의 기존 임베딩을 새로 등록할까요?"):
             return
-        self.enrollment = Enrollment(name)
+        self.enrollment = SimpleNamespace(name=name, samples=[])
         self._set_purpose("enroll")
         self.progress["value"] = 0
         self.register_button.configure(state="disabled")
@@ -467,7 +464,11 @@ class FaceApp:
         self.gate_ready = False
         self.last_challenge_prompt = None
         if self.worker and not self.worker.stop_event.is_set():
-            self.worker.commands.put(("purpose", (purpose, self.session_id)))
+            self.worker.requested_session = self.session_id
+            value = (purpose, self.session_id)
+            if purpose == 'enroll':
+                value += (self.enrollment.name,)
+            self.worker.commands.put(("purpose", value))
 
     def _tab_changed(self, event=None):
         if self.enrollment is not None:
@@ -504,8 +505,8 @@ class FaceApp:
             if telemetry.saved_this_frame:
                 self.last_saved_at = time.monotonic()
             self.save_activity.set("인증 성공 시에만 저장" if telemetry.authenticated_name is None else
-                                   (f"이번에 {telemetry.saved_this_frame}장 저장" if telemetry.saved_this_frame
-                                    else f"다음 저장까지 {telemetry.next_save_in:.1f}초"))
+                                   (f"두 방향 통과 · {telemetry.saved_this_frame}장 함께 저장" if telemetry.saved_this_frame
+                                    else "두 방향 비교 완료 대기"))
             self.indicators.set_stage(1, "얼굴 대기" if not telemetry.detected_count else
                                       ("조건 통과" if self.gate_ready else "조건 확인 중"),
                                       "green" if self.gate_ready else "yellow")
@@ -524,23 +525,21 @@ class FaceApp:
             self.power_text.set(details)
             self.indicators.set_stage(4, self.save_activity.get(), "blue" if telemetry.saved_this_frame else "off")
         if self.enrollment:
-            status = self.enrollment.accept(faces if self.gate_ready else [], captured_at)
-            self.status.set(gate_status if not self.gate_ready and gate_status else status)
-            self.progress["value"] = len(self.enrollment.samples)
-            if captured_at - self.enrollment.started > 60:
+            count = telemetry.enrollment_count if telemetry else 0
+            self.enrollment.samples = [None] * count  # UI progress only; worker owns the real samples
+            self.progress['value'] = count
+            self.status.set(gate_status or '촬영 준비 중')
+            if telemetry and telemetry.enrollment_error:
+                error = telemetry.enrollment_error
                 self.cancel_enrollment()
-                self.status.set("등록 시간이 초과되었습니다. 조명과 위치를 조절한 후 다시 등록하세요.")
-            elif len(self.enrollment.samples) == REGISTRATION_SAMPLES:
-                name = self.enrollment.name
-                try:
-                    add_user(self.store, name, self.enrollment.samples)
-                except (ValueError, OSError) as exc:
-                    self.cancel_enrollment()
-                    messagebox.showerror("등록 실패", str(exc))
-                else:
-                    self.cancel_enrollment()
-                    self._refresh_people()
-                    self.status.set(f"‘{name}’ 등록 완료 · 128차원 임베딩을 저장했습니다.")
+                self.status.set(error)
+            elif telemetry and telemetry.enrollment_completed:
+                name = telemetry.enrollment_completed
+                self.cancel_enrollment()
+                self.store.refresh()
+                self._refresh_people()
+                self.progress['value'] = 15
+                self.status.set(f'‘{name}’ 등록 완료 · 5방향 15장의 사진·Mesh·임베딩을 저장했습니다.')
         else:
             self.register_button.configure(state="normal" if self.gate_ready else "disabled")
             if gate_status:
@@ -577,6 +576,18 @@ class FaceApp:
             background = self.canvas.create_rectangle(self.canvas.bbox(text), fill="#141d2d", outline="")
             self.canvas.tag_lower(background, text)
         self.result.set(" / ".join(labels) if labels else "대기 조건 확인 중")
+        if telemetry and telemetry.direction:
+            target = telemetry.direction
+            vectors = {'up': (320, 105, 320, 45), 'down': (320, 45, 320, 105),
+                       'left': (350, 70, 290, 70), 'right': (290, 70, 350, 70)}
+            self.canvas.create_rectangle(260, 30, 380, 140, fill='#141d2d', outline='')
+            if target in vectors:
+                self.canvas.create_line(*vectors[target], fill='#fbbf24', width=6,
+                                        arrow=tk.LAST, arrowshape=(16, 20, 10))
+            else:
+                self.canvas.create_oval(305, 55, 335, 85, outline='#fbbf24', width=4)
+            self.canvas.create_text(320, 120, text=LABELS[target], fill='white', font=('맑은 고딕', 13, 'bold'))
+            self.result.set(telemetry.status)
         self.canvas.create_text(10, 468, anchor="sw", text=f"{fps:.0f} FPS · 유사도 기준 {self.threshold.get():.2f}",
                                 fill="white", font=("맑은 고딕", 10))
         if saved_count is not None:

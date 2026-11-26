@@ -1,0 +1,21 @@
+{
+  "front_degrees": 12.0,
+  "yaw_min": 15.0,
+  "yaw_max": 35.0,
+  "pitch_min": 12.0,
+  "pitch_max": 30.0,
+  "cross_degrees": 12.0,
+  "roll_max": 15.0,
+  "hold_seconds": 0.25,
+  "min_frames": 3,
+  "sample_interval": 0.4,
+  "max_gap": 0.7,
+  "enroll_timeout": 120.0,
+  "enroll_step_timeout": 25.0,
+  "auth_timeout": 25.0,
+  "auth_step_timeout": 10.0,
+  "mesh_limit": 0.12,
+  "depth_limit": 0.08,
+  "yaw_sign": 1,
+  "pitch_sign": 1
+}
