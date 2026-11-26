@@ -4,6 +4,7 @@ stages/data/
 # 가상환경, 캐시, 다운로드 모델(setup.bat이 받음)
 .venv/
 .venv-pi/
+.venv-pi313/
 work/
 __pycache__/
 stages/models/*.onnx

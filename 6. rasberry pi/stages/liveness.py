@@ -66,7 +66,7 @@ class FaceMeshEstimator:
             from mediapipe.tasks import python
             from mediapipe.tasks.python import vision
         except ImportError as exc:
-            raise RuntimeError("Face Mesh가 없습니다. setup.bat 또는 requirements.txt로 설치하세요.") from exc
+            raise RuntimeError("Face Mesh가 없습니다. bash setup_pi.sh로 설치하세요.") from exc
         path = ensure_landmarker(progress)
         self.mp = mp
         self.timestamp = -1

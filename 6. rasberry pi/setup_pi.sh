@@ -4,11 +4,11 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$SCRIPT_DIR"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-VENV_DIR="${FACE_ACCESS_VENV:-$SCRIPT_DIR/.venv-pi}"
+VENV_DIR="${FACE_ACCESS_VENV:-$SCRIPT_DIR/.venv-pi313}"
 
 if [[ "${1:-}" == "--help" ]]; then
     echo '사용법: bash setup_pi.sh'
-    echo '64비트 Raspberry Pi OS, Python 3.11/3.12에서 실행하세요.'
+    echo '64비트 Raspberry Pi OS, Python 3.13.5 이상인 3.13 계열에서 실행하세요.'
     exit 0
 fi
 if [[ $# -gt 0 ]]; then
@@ -19,6 +19,18 @@ trap 'echo "설치가 중단되었습니다. 위 오류를 해결한 뒤 bash se
 
 # Reject unsupported interpreters before making any system changes.
 "$PYTHON_BIN" check_pi.py --platform-only
+"$PYTHON_BIN" - <<'PY'
+import subprocess
+import sys
+
+selected = f"{sys.version_info.major} {sys.version_info.minor}"
+native = subprocess.check_output(
+    ["/usr/bin/python3", "-c", "import sys; print(sys.version_info.major, sys.version_info.minor)"],
+    text=True,
+).strip()
+if native != selected:
+    raise SystemExit("선택한 Python과 apt의 시스템 Python 버전이 다릅니다. libcamera와 python3-tk도 같은 3.13용이어야 합니다.")
+PY
 if [[ -e "$VENV_DIR" && ! -x "$VENV_DIR/bin/python" ]]; then
     echo "Linux용 가상환경이 아닙니다: $VENV_DIR" >&2
     echo 'FACE_ACCESS_VENV에 새 폴더를 지정하세요. 기존 데이터는 자동 삭제하지 않습니다.' >&2

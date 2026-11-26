@@ -1,12 +1,5 @@
-opencv-contrib-python==4.13.0.92; platform_machine != "aarch64"
-numpy==2.5.4; platform_machine != "aarch64"
-Pillow==13.0.0; platform_machine != "aarch64"
-mediapipe==0.10.35; platform_machine != "aarch64"
-# 64-bit Raspberry Pi OS, Python 3.11/3.12.
-opencv-contrib-python==4.11.0.86; platform_machine == "aarch64"
-numpy==1.26.4; platform_machine == "aarch64"
-Pillow==11.3.0; platform_machine == "aarch64"
-mediapipe==0.10.18; platform_machine == "aarch64"
-jax==0.5.3; platform_machine == "aarch64"
-jaxlib==0.5.3; platform_machine == "aarch64"
-ml-dtypes==0.4.1; platform_machine == "aarch64"
+# CPython 3.13.5+ (3.13 series), Linux ARM64 glibc >= 2.28.
+opencv-contrib-python==4.13.0.92
+numpy==2.5.4
+Pillow==13.0.0
+mediapipe==1.2.3

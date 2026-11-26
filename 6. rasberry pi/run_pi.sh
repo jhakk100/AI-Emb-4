@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$SCRIPT_DIR"
-VENV_DIR="${FACE_ACCESS_VENV:-$SCRIPT_DIR/.venv-pi}"
+VENV_DIR="${FACE_ACCESS_VENV:-$SCRIPT_DIR/.venv-pi313}"
 PYTHON="$VENV_DIR/bin/python"
 
 usage() {

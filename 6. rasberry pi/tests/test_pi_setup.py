@@ -21,17 +21,34 @@ import check_pi
 
 class PiSetupTests(unittest.TestCase):
     def test_supported_python_versions_and_64_bit_os(self):
-        for version in ((3, 11, 2), (3, 12, 4)):
+        for version in ((3, 13, 5), (3, 13, 14)):
             check_pi.validate_platform('Linux', 'aarch64', version)
 
     def test_unsupported_platforms_fail_with_actionable_reason(self):
         cases = [('Windows', 'AMD64', (3, 11), '64비트'),
                  ('Linux', 'armv7l', (3, 11), '64비트'),
-                 ('Linux', 'aarch64', (3, 13), '3.11/3.12'),
-                 ('Linux', 'aarch64', (3, 10), '3.11/3.12')]
+                 ('Linux', 'aarch64', (3, 13, 4), '3.13.5'),
+                 ('Linux', 'aarch64', (3, 12, 9), '3.13.5'),
+                 ('Linux', 'aarch64', (3, 14, 0), '3.13.5')]
         for system, machine, version, reason in cases:
             with self.subTest(version=version), self.assertRaisesRegex(RuntimeError, reason):
                 check_pi.validate_platform(system, machine, version)
+
+    def test_target_platform_and_libc_are_accepted(self):
+        with patch('check_pi.platform.system', return_value='Linux'), \
+                patch('check_pi.platform.machine', return_value='aarch64'), \
+                patch('check_pi.sys.version_info', (3, 13, 5)), \
+                patch('check_pi.platform.libc_ver', return_value=('glibc', '2.41')), \
+                redirect_stdout(StringIO()):
+            check_pi.check_platform()
+
+    def test_old_glibc_is_rejected_before_binary_imports(self):
+        with patch('check_pi.platform.system', return_value='Linux'), \
+                patch('check_pi.platform.machine', return_value='aarch64'), \
+                patch('check_pi.sys.version_info', (3, 13, 5)), \
+                patch('check_pi.platform.libc_ver', return_value=('glibc', '2.27')), \
+                self.assertRaisesRegex(RuntimeError, 'glibc 2.28'):
+            check_pi.check_platform()
 
     def test_platform_only_does_not_import_runtime_or_touch_camera(self):
         with patch('check_pi.check_platform'), \
@@ -61,7 +78,7 @@ class PiSetupTests(unittest.TestCase):
             names.append(name)
             if name == 'picamera2':
                 raise ImportError('libcamera unavailable')
-            version = {'numpy': '1.26.4', 'mediapipe': '0.10.18'}.get(name, 'test')
+            version = {'numpy': '2.5.4', 'mediapipe': '1.2.3'}.get(name, 'test')
             return SimpleNamespace(__version__=version, FaceDetectorYN=object, FaceRecognizerSF=object)
         with patch('check_pi.importlib.import_module', side_effect=importing), redirect_stdout(StringIO()):
             errors = check_pi.check_dependencies()

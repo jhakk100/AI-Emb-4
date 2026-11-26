@@ -22,6 +22,9 @@ Python dependency licenses are included with their installed distributions.
 
 ## MediaPipe Face Landmarker
 
+Python runtime: MediaPipe 1.2.3, official Python 3 Linux ARM64 wheel
+(glibc >= 2.28), https://pypi.org/project/mediapipe/1.2.3/ .
+
 - Source: https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker
 - Versioned task: https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 - SHA-256: `64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`

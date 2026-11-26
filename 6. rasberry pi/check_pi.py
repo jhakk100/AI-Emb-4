@@ -11,16 +11,17 @@ import time
 def validate_platform(system, machine, version):
     if system != 'Linux' or machine.lower() != 'aarch64':
         raise RuntimeError('64비트 Raspberry Pi OS(aarch64)가 필요합니다.')
-    if tuple(version[:2]) not in ((3, 11), (3, 12)):
+    if tuple(version[:2]) != (3, 13) or tuple(version[:3]) < (3, 13, 5):
         raise RuntimeError(
-            '현재 Pi 설치 조합은 Python 3.11/3.12용입니다. '
-            'Python 3.11의 64비트 Raspberry Pi OS Bookworm을 사용하거나 '
-            'apt의 libcamera/Picamera2와 같은 버전의 지원 Python을 지정하세요. '
-            'Python 3.13 이상에서는 이 MediaPipe ARM 배포 파일을 사용할 수 없습니다.')
+            '현재 Pi 설치 조합은 Python 3.13.5 이상인 3.13 계열용입니다. '
+            'Python 3.13.5와 같은 인터프리터용 libcamera/Picamera2를 사용하세요.')
 
 
 def check_platform():
     validate_platform(platform.system(), platform.machine(), sys.version_info)
+    libc, version = platform.libc_ver()
+    if libc != 'glibc' or tuple(int(v) for v in version.split('.')[:2]) < (2, 28):
+        raise RuntimeError('MediaPipe ARM64 배포 파일은 glibc 2.28 이상이 필요합니다.')
     print(f'환경 확인: {platform.machine()} / Python {platform.python_version()}')
 
 
@@ -29,10 +30,10 @@ def check_dependencies():
     for name in ('numpy', 'cv2', 'mediapipe', 'PIL', 'picamera2', 'libcamera', 'gpiozero', 'tkinter'):
         try:
             module = importlib.import_module(name)
-            if name == 'numpy' and module.__version__ != '1.26.4':
-                raise RuntimeError('Pi용 NumPy 1.26.4가 필요합니다. setup_pi.sh를 다시 실행하세요.')
-            if name == 'mediapipe' and module.__version__ != '0.10.18':
-                raise RuntimeError('Pi용 MediaPipe 0.10.18이 필요합니다. setup_pi.sh를 다시 실행하세요.')
+            if name == 'numpy' and module.__version__ != '2.5.4':
+                raise RuntimeError('NumPy 2.5.4가 필요합니다. setup_pi.sh를 다시 실행하세요.')
+            if name == 'mediapipe' and module.__version__ != '1.2.3':
+                raise RuntimeError('MediaPipe 1.2.3이 필요합니다. setup_pi.sh를 다시 실행하세요.')
             if name == 'cv2' and (not hasattr(module, 'FaceDetectorYN') or not hasattr(module, 'FaceRecognizerSF')):
                 raise RuntimeError('YuNet/SFace를 지원하는 OpenCV contrib가 필요합니다.')
             print(f'정상: {name} {getattr(module, "__version__", "")}')
