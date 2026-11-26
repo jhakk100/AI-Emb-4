@@ -76,17 +76,19 @@ class Stages:
 
 class Camera:
     """임시통합 app.py와 같은 방식: 절전/활성 해상도 전환, 소프트웨어로 정확한 분석 해상도 맞춤."""
-    def __init__(self, stages, index, flip=True):
+    def __init__(self, stages, index, flip=True, profile=None):
         self.stages, self.flip = stages, flip
         self.cv2, self.control = stages.cv2, stages.capture_control
-        self.profile = self.control.STANDBY_PROFILE
+        self.profile = profile or self.control.STANDBY_PROFILE
         self.capture = stages.face_core.open_camera(index, size=self.profile.size, fps=self.profile.fps)
         self.failures = 0
+        self.resolution_gate = self.control.EnrollmentResolutionGate()
 
     def read(self, profile):
         if profile != self.profile:
             self.control.configure_capture(self.capture, profile.size, profile.fps)
             self.profile = profile
+            self.resolution_gate.reset()
         ok, frame = self.capture.read()
         if not ok or frame is None:
             self.failures += 1
@@ -94,6 +96,8 @@ class Camera:
                 raise RuntimeError('카메라 영상이 끊겼습니다. 다른 앱의 카메라 사용 여부를 확인하세요.')
             return None
         self.failures = 0
+        if not self.resolution_gate.accept(frame, profile):
+            return None
         if self.flip:
             frame = self.cv2.flip(frame, 1)
         return self.control.prepare_frame(frame, profile.size)
@@ -301,7 +305,8 @@ def cmd_enroll(args):
     camera = preview = pipeline = None
     last_status = None
     try:
-        camera = Camera(stages, args.camera, flip=not args.no_flip)
+        camera = Camera(stages, args.camera, flip=not args.no_flip,
+                        profile=stages.capture_control.ENROLLMENT_PROFILE)
         pipeline = stages.new_pipeline(f'camera:{args.camera}', purpose='enroll', enrollment_name=args.name)
         preview = Preview(stages.cv2) if args.show else None
         print(f'등록: {args.name} - 정면·상·하·좌·우마다 3장씩, 총 {target}장',

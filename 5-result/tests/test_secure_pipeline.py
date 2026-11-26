@@ -19,6 +19,7 @@ from guided_capture import (CaptureSample, DIRECTIONS, FACE_POINTS, GuidedCaptur
 from liveness import Pose
 from pipeline import FacePipeline
 from standby import FaceWatcher, GateSettings
+from capture_control import ENROLLMENT_PROFILE, STANDBY_PROFILE
 
 BOX = (240., 120., 160., 190.)
 SIZE = (640, 480)
@@ -178,6 +179,7 @@ class PipelineTests(unittest.TestCase):
         self.mesh.observe.return_value = Pose(0, 0, 0, BOX, landmarks())
         self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
         self.now, self.pose = 0., Pose(0, 0, 0, BOX)
+        self.box = BOX
         self.pipeline = FacePipeline(self.engine, FaceWatcher(GateSettings(hold_seconds=0)), self.store,
             mesh=self.mesh, start_in_standby=False, pose_estimator=lambda row, size: self.pose)
         self.addCleanup(self.pipeline.close)
@@ -189,7 +191,7 @@ class PipelineTests(unittest.TestCase):
     def tick(self, direction='front', advance=.15):
         self.now += advance
         yaw, pitch = ANGLES[direction]
-        self.pose = Pose(yaw, pitch, 0, BOX)
+        self.pose = Pose(yaw, pitch, 0, self.box)
         with patch('pipeline.monotonic', return_value=self.now), \
                 patch('standby.time.monotonic', return_value=self.now):
             return self.pipeline.process(self.frame)
@@ -201,6 +203,16 @@ class PipelineTests(unittest.TestCase):
                 return result
             result = self.tick(self.pipeline.challenge.target or 'front')
         self.fail('directional session did not terminate')
+
+    def begin_enrollment(self):
+        self.frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        row = detection() * np.array([3., 2.25]*7 + [1.], dtype=np.float32)
+        self.box = tuple(row[:4])
+        self.engine.detect.return_value = np.array([row])
+        self.engine.analyze.return_value = [Face(self.box, self.vector.copy(), 100)]
+        self.mesh.observe.return_value = Pose(0, 0, 0, self.box, landmarks())
+        with patch('pipeline.monotonic', return_value=self.now):
+            self.pipeline.set_purpose('enroll', 3, enrollment_name='new')
 
     def test_front_only_does_not_run_mesh_or_authorize(self):
         for _ in range(10):
@@ -219,11 +231,11 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(self.tick().authentication_attempted)
 
     def test_enroll_captures_exactly_three_per_direction_before_commit(self):
-        self.pipeline.set_purpose('enroll', 3, enrollment_name='new')
-        self.pipeline.mode = 'active'
+        self.begin_enrollment()
         self.tick()
         result = None
         while not self.pipeline.terminal:
+            self.assertEqual(self.pipeline.profile, ENROLLMENT_PROFILE)
             if len(self.pipeline.challenge.samples) < 15:
                 self.assertNotIn('new', self.store.people)
             result = self.tick(self.pipeline.challenge.target)
@@ -233,6 +245,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.mesh.observe.call_count, 15)
         self.assertFalse(result.authentication_attempted)
         self.assertEqual(self.store.count_observations(), 0)
+        self.assertEqual({row['size'] for row in self.store.directional_samples('new')}, {(1920, 1080)})
 
     def test_mesh_and_embedding_read_the_same_frozen_snapshot(self):
         self.tick()
@@ -322,8 +335,7 @@ class PipelineTests(unittest.TestCase):
         self.mesh.observe.assert_not_called()
 
     def test_enrollment_loss_discards_partial_and_cancel_never_commits(self):
-        self.pipeline.set_purpose('enroll', 3, enrollment_name='new')
-        self.pipeline.mode = 'active'
+        self.begin_enrollment()
         self.tick()
         while not self.pipeline.challenge.samples:
             self.tick()
@@ -348,12 +360,59 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.pipeline.pose_origin, (5, 18))
 
     def test_enrollment_waiting_for_face_has_total_timeout(self):
-        with patch('pipeline.monotonic', return_value=self.now):
-            self.pipeline.set_purpose('enroll', 3, enrollment_name='new')
+        self.begin_enrollment()
         self.engine.detect.return_value = np.empty((0, 15))
         result = self.tick(advance=121)
         self.assertTrue(result.enrollment_error)
         self.assertFalse(result.authentication_attempted)
+        self.assertNotIn('new', self.store.people)
+
+    def test_enrollment_stage_rejects_implicit_stage_and_threshold_changes(self):
+        self.begin_enrollment()
+        self.tick()
+        challenge = self.pipeline.challenge
+        self.assertEqual(self.pipeline.mode, 'enrollment')
+        for purpose in ('authenticate', 'preview', 'departure'):
+            self.assertFalse(self.pipeline.set_purpose(purpose, 4))
+            self.assertEqual(self.pipeline.session_id, 3)
+            self.assertEqual(self.pipeline.profile, ENROLLMENT_PROFILE)
+        self.assertFalse(self.pipeline.reset_standby())
+        self.pipeline.threshold = .7
+        self.assertEqual(self.pipeline.threshold, .45)
+        self.assertIs(self.pipeline.challenge, challenge)
+
+    def test_only_explicit_cancel_releases_unfinished_enrollment(self):
+        self.begin_enrollment()
+        self.tick()
+        self.assertTrue(self.pipeline.set_purpose('preview', 4, cancel_enrollment=True))
+        self.assertFalse(self.pipeline.enrollment_locked)
+        self.assertEqual(self.pipeline.profile, STANDBY_PROFILE)
+        self.assertIsNone(self.pipeline.challenge)
+        self.assertNotIn('new', self.store.people)
+
+    def test_non_fhd_frame_never_reaches_enrollment_models(self):
+        self.begin_enrollment()
+        self.engine.detect.reset_mock()
+        with patch('pipeline.monotonic', return_value=self.now+.1), self.assertRaisesRegex(RuntimeError, 'FHD'):
+            self.pipeline.process(np.zeros((480, 640, 3), np.uint8))
+        self.engine.detect.assert_not_called()
+        self.mesh.observe.assert_not_called()
+
+    def test_enrollment_constructor_starts_in_fhd_with_requested_threshold(self):
+        pipeline = FacePipeline(self.engine, store=self.store, purpose='enroll', enrollment_name='new',
+                                threshold=.6, mesh=Mock())
+        self.addCleanup(pipeline.close)
+        self.assertEqual(pipeline.profile, ENROLLMENT_PROFILE)
+        self.assertEqual(pipeline.mode, 'enrollment')
+        self.assertEqual(pipeline.threshold, .6)
+
+    def test_waiting_for_initial_frontal_pose_keeps_enrollment_fhd(self):
+        self.begin_enrollment()
+        self.engine.detect.return_value = np.empty((0, 15))
+        for _ in range(5):
+            self.tick()
+            self.assertEqual(self.pipeline.profile, ENROLLMENT_PROFILE)
+            self.assertEqual(self.pipeline.mode, 'enrollment')
         self.assertNotIn('new', self.store.people)
 
 

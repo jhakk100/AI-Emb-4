@@ -18,7 +18,8 @@ import cv2
 import numpy as np
 
 import app
-from capture_control import STANDBY_PROFILE, configure_capture
+from capture_control import (STANDBY_PROFILE, ENROLLMENT_PROFILE, configure_capture,
+                             EnrollmentResolutionGate)
 from database import initialize_database
 from pi_camera import PiCamera
 from pipeline import FrameResult
@@ -30,6 +31,42 @@ def result(**kwargs):
 
 
 class CameraRuntimeTests(unittest.TestCase):
+    def test_worker_requests_fhd_and_never_processes_old_buffered_vga(self):
+        worker = app.CameraWorker(0, Queue(maxsize=1), Queue(), Queue(maxsize=1))
+        capture = Mock()
+        capture.read.side_effect = [(True, np.zeros((480, 640, 3), np.uint8)),
+                                    (True, np.zeros((1080, 1920, 3), np.uint8))]
+        capture.get.return_value = 20
+        pipeline = Mock(profile=ENROLLMENT_PROFILE)
+        pipeline.process.return_value = result(enrollment_completed='new', power_mode='enrollment',
+                                                processing_size=(1920, 1080))
+        def wait(delay):
+            if worker.pause_event.is_set():
+                worker.stop_event.set()
+        with patch('app.ensure_models', return_value=('d', 'r')), patch('app.FaceEngine'), \
+                patch('app.FacePipeline', return_value=pipeline), \
+                patch('app.open_camera', return_value=capture) as opening, \
+                patch.object(worker.stop_event, 'wait', side_effect=wait):
+            worker.run()
+        opening.assert_called_once_with(0, size=(1920, 1080), fps=20)
+        pipeline.process.assert_called_once()
+        self.assertEqual(pipeline.process.call_args.args[0].shape, (1080, 1920, 3))
+        self.assertEqual(worker.frames.get_nowait()[-1].capture_size, (1920, 1080))
+        capture.release.assert_called_once()
+
+    def test_registration_discards_buffered_low_resolution_then_accepts_fhd(self):
+        gate = EnrollmentResolutionGate()
+        self.assertFalse(gate.accept(np.zeros((480, 640, 3), np.uint8), ENROLLMENT_PROFILE))
+        self.assertTrue(gate.accept(np.zeros((1080, 1920, 3), np.uint8), ENROLLMENT_PROFILE))
+        self.assertEqual(gate.misses, 0)
+
+    def test_unsupported_fhd_camera_fails_instead_of_upscaling(self):
+        gate = EnrollmentResolutionGate(max_misses=2)
+        low = np.zeros((720, 1280, 3), np.uint8)
+        self.assertFalse(gate.accept(low, ENROLLMENT_PROFILE))
+        with self.assertRaisesRegex(RuntimeError, 'FHD'):
+            gate.accept(low, ENROLLMENT_PROFILE)
+
     def test_terminal_packet_is_not_overwritten_and_resources_close(self):
         worker = app.CameraWorker(0, Queue(maxsize=1), Queue(), Queue(maxsize=1))
         capture = Mock()
@@ -197,6 +234,41 @@ class GuiSessionTests(unittest.TestCase):
         self.assertEqual(command, 'purpose')
         self.assertEqual(payload[0], 'enroll')
         self.assertEqual(payload[2], 'new')
+
+    def _start_registration(self):
+        import time
+        self.ui.gate_ready = True
+        self.ui.last_frame_at = time.monotonic()
+        self.ui.name.set('new')
+        self.ui.register()
+
+    def test_registration_locks_tabs_and_restores_the_registration_tab(self):
+        self._start_registration()
+        epoch = self.ui.session_id
+        self.assertEqual(self.ui.tabs.tab(self.ui.auth_tab, 'state'), 'disabled')
+        self.assertEqual(self.ui.tabs.tab(self.ui.history_tab, 'state'), 'disabled')
+        self.ui._tab_changed()
+        self.assertIsNotNone(self.ui.enrollment)
+        self.assertEqual(self.ui.tabs.select(), str(self.ui.enroll_tab))
+        self.assertEqual(self.ui.session_id, epoch)
+        self.assertFalse(self.ui._set_purpose('authenticate'))
+        self.assertEqual(self.ui.session_id, epoch)
+
+    def test_explicit_registration_cancel_unlocks_ui_and_notifies_worker(self):
+        self._start_registration()
+        self.ui.worker.commands.get_nowait()
+        self.ui.cancel_enrollment()
+        self.assertIsNone(self.ui.enrollment)
+        self.assertEqual(self.ui.tabs.tab(self.ui.auth_tab, 'state'), 'normal')
+        self.assertEqual(self.ui.worker.commands.get_nowait()[0], 'cancel_enrollment')
+
+    def test_threshold_changes_are_ignored_during_registration(self):
+        self._start_registration()
+        epoch = self.ui.session_id
+        self.ui.apply_threshold('.7')
+        self.assertEqual(self.ui.session_id, epoch)
+        self.assertEqual(self.ui.threshold.get(), .45)
+        self.assertTrue(self.ui.threshold_slider.instate(['disabled']))
 
 
 if __name__ == '__main__':

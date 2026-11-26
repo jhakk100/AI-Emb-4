@@ -1,4 +1,4 @@
-"""화면 RGB LED와 1~5단계 상태 표시 (임시통합 status_panel.py에 5단계 칸 추가)."""
+"""화면 RGB LED, 1~5단계 상태와 별도 FHD 얼굴등록단계 표시."""
 
 import time
 import tkinter as tk
@@ -35,6 +35,15 @@ class StatusPanel(ttk.Frame):
             label.pack(anchor="w")
             self.details.append(detail)
             self.stage_labels.append(label)
+        self.enrollment_detail = tk.StringVar(value='별도 단계 · 얼굴등록 대기')
+        ttk.Label(self, textvariable=self.enrollment_detail, foreground='#7e22ce',
+                  wraplength=640).pack(anchor='w', pady=(5, 0))
+
+    def set_enrollment(self, active, count=0):
+        self.enrollment_detail.set(f'얼굴등록단계 · FHD 1920×1080 고정 · {count}/15장 · 다른 단계 이동 잠금'
+                                   if active else '별도 단계 · 얼굴등록 대기')
+        if active:
+            self.phase.set('현재 단계: 얼굴등록 · FHD 고정')
 
     def set_led(self, color, text, blink=False):
         self.color, self.blink = color, blink
@@ -50,6 +59,7 @@ class StatusPanel(ttk.Frame):
             self.stage5_color = color
 
     def idle(self, text="카메라 시작 대기"):
+        self.set_enrollment(False)
         self.phase.set(f"현재 단계: {text}")
         self.set_led("off", text)
         for stage in range(1, 6):

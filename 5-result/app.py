@@ -28,7 +28,8 @@ from models import ensure_models
 from authenticate import authenticate_face
 from database import delete_user, initialize_database
 from stage5_cycle import Stage5Cycle
-from capture_control import STANDBY_PROFILE, configure_capture, frame_delay, prepare_frame
+from capture_control import (STANDBY_PROFILE, configure_capture, frame_delay, prepare_frame,
+                             EnrollmentResolutionGate)
 from pipeline import FacePipeline
 from guided_capture import LABELS
 from status_panel import StatusPanel
@@ -77,6 +78,7 @@ class CameraWorker(threading.Thread):
             failures = 0
             previous_frame_at = None
             previous_processing_at = None
+            resolution_gate = EnrollmentResolutionGate()
             while not self.stop_event.is_set():
                 while True:
                     try:
@@ -89,10 +91,12 @@ class CameraWorker(threading.Thread):
                         pipeline.threshold = value
                     elif setting == "reset_gate":
                         pipeline.reset_standby()
-                    elif setting == "purpose":
+                    elif setting in ("purpose", "cancel_enrollment"):
                         purpose, session_id, *name = value
-                        pipeline.set_purpose(purpose, session_id, enrollment_name=name[0] if name else None)
-                        self.pause_event.clear()
+                        accepted = pipeline.set_purpose(purpose, session_id, enrollment_name=name[0] if name else None,
+                                                        cancel_enrollment=setting == 'cancel_enrollment')
+                        if accepted:
+                            self.pause_event.clear()
                 if self.pause_event.is_set():
                     self.stop_event.wait(.05)
                     continue
@@ -103,6 +107,7 @@ class CameraWorker(threading.Thread):
                     configured_profile = profile
                     previous_frame_at = None
                     previous_processing_at = None
+                    resolution_gate.reset()
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     pipeline.reset_standby()
@@ -112,6 +117,10 @@ class CameraWorker(threading.Thread):
                     self.stop_event.wait(0.1)
                     continue
                 failures = 0
+                if not resolution_gate.accept(frame, profile):
+                    self._stage('얼굴등록단계 · FHD 카메라 전환 대기')
+                    self.stop_event.wait(.05)
+                    continue
                 # Driver buffers can return bursts after a blocking read. Limit
                 # actual inference starts as well as camera-loop start times.
                 if previous_processing_at is not None:
@@ -195,6 +204,7 @@ class FaceApp:
         self.camera = tk.StringVar(value=str(camera))
         self.name = tk.StringVar()
         self.threshold = tk.DoubleVar(value=DEFAULT_THRESHOLD)
+        self.applied_threshold = DEFAULT_THRESHOLD
         self.status = tk.StringVar(value="카메라 시작을 누르면 미리보기가 켜집니다.")
         self.result = tk.StringVar(value="인식 대기 중")
         self.threshold_text = tk.StringVar(value=f"{DEFAULT_THRESHOLD:.2f}")
@@ -244,6 +254,7 @@ class FaceApp:
                         command=self.apply_mode).pack(side="left")
         ttk.Radiobutton(mode_row, text="1회 작동", variable=self.mode, value="once",
                         command=self.apply_mode).pack(side="right")
+        self.mode_buttons = mode_row.winfo_children()
         ttk.Label(right, text="1회: 인증 → 열림 → 닫힘 후 중지").pack(anchor="w", pady=(0, 8))
         ttk.Label(right, text="카메라 연결", style="Result.TLabel").pack(anchor="w")
         row = ttk.Frame(right)
@@ -262,6 +273,7 @@ class FaceApp:
         tabs.pack(fill="both", expand=True)
         auth_tab, enroll_tab, history_tab = (ttk.Frame(tabs, padding=8) for _ in range(3))
         self.tabs, self.auth_tab = tabs, auth_tab   # 5단계(출입 처리)는 '인식·기록' 탭에서만
+        self.enroll_tab, self.history_tab = enroll_tab, history_tab
         tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
         tabs.add(auth_tab, text="인식·기록")
         tabs.add(enroll_tab, text="사용자 등록")
@@ -289,8 +301,9 @@ class FaceApp:
         self.delete_button.pack(fill="x", pady=6)
 
         ttk.Label(auth_tab, text="인식 기준 · 높을수록 엄격").pack(anchor="w", pady=(6, 0))
-        ttk.Scale(auth_tab, from_=0.30, to=0.80, variable=self.threshold,
-                  command=self.apply_threshold).pack(fill="x")
+        self.threshold_slider = ttk.Scale(auth_tab, from_=0.30, to=0.80, variable=self.threshold,
+                                          command=self.apply_threshold)
+        self.threshold_slider.pack(fill="x")
         ttk.Label(auth_tab, textvariable=self.threshold_text).pack(anchor="e")
         ttk.Label(history_tab, text="최근 Crop · 선택하면 미리보기").pack(anchor="w")
         self.history = ttk.Treeview(history_tab, columns=("id", "name", "embedding"), show="headings", height=6)
@@ -321,7 +334,11 @@ class FaceApp:
         self.status.set(f"DB 저장 간격을 {interval:g}초로 적용했습니다.")
 
     def apply_threshold(self, value):
+        if self.enrollment is not None:
+            self.threshold.set(self.applied_threshold)
+            return
         threshold = float(value)
+        self.applied_threshold = threshold
         self.threshold_text.set(f"{threshold:.2f}")
         if self.worker and not self.worker.stop_event.is_set():
             self.worker.commands.put(("threshold", threshold))
@@ -329,6 +346,9 @@ class FaceApp:
                 self._set_purpose(self._purpose())
 
     def apply_mode(self):
+        if self.enrollment is not None:
+            self.mode.set(self.door.mode)
+            return
         self.door.mode = self.mode.get()
         self.status.set("연속 모드: 문이 닫히면 1단계로 돌아갑니다." if self.door.mode == "continuous"
                         else "1회 모드: 인증 후 문이 닫히면 카메라를 중지합니다.")
@@ -421,6 +441,8 @@ class FaceApp:
             self.indicators.idle("카메라 중지 중")
 
     def register(self):
+        if self.enrollment is not None or self.door.phase != 'waiting':
+            return
         if self.worker is None or self.worker.stop_event.is_set() or time.monotonic() - self.last_frame_at > 2:
             messagebox.showinfo("얼굴 등록", "먼저 카메라 영상을 확인해주세요.")
             return
@@ -434,19 +456,31 @@ class FaceApp:
         if name in self.store.people and not messagebox.askyesno("다시 등록", f"‘{name}’의 기존 임베딩을 새로 등록할까요?"):
             return
         self.enrollment = SimpleNamespace(name=name, samples=[])
+        self._lock_enrollment_ui(True)
         self._set_purpose("enroll")
         self.progress["value"] = 0
         self.register_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.name_input.configure(state="disabled")
         self.delete_button.configure(state="disabled")
-        self.status.set("정면을 바라보며 얼굴을 화면에 맞춰주세요.")
+        self.status.set("얼굴등록단계 · FHD로 전환 중입니다. 완료 또는 취소 전에는 다른 단계로 이동하지 않습니다.")
+
+    def _lock_enrollment_ui(self, locked):
+        for tab in (self.auth_tab, self.history_tab):
+            self.tabs.tab(tab, state='disabled' if locked else 'normal')
+        for button in self.mode_buttons:
+            button.configure(state='disabled' if locked else 'normal')
+        self.threshold_slider.configure(state='disabled' if locked else 'normal')
+        if locked:
+            self.tabs.select(self.enroll_tab)
+        self.indicators.set_enrollment(locked, 0)
 
     def cancel_enrollment(self):
         was_enrolling = self.enrollment is not None
         self.enrollment = None
+        self._lock_enrollment_ui(False)
         if was_enrolling:
-            self._set_purpose(self._purpose())
+            self._set_purpose(self._purpose(), cancel_enrollment=True)
         self.progress["value"] = 0
         self.cancel_button.configure(state="disabled")
         self.name_input.configure(state="normal")
@@ -459,7 +493,10 @@ class FaceApp:
             return "enroll"
         return "authenticate" if self.tabs.select() == str(self.auth_tab) else "preview"
 
-    def _set_purpose(self, purpose):
+    def _set_purpose(self, purpose, cancel_enrollment=False):
+        if self.enrollment is not None and not cancel_enrollment:
+            if purpose != 'enroll':
+                return False
         self.session_id += 1
         self.gate_ready = False
         self.last_challenge_prompt = None
@@ -468,16 +505,20 @@ class FaceApp:
             value = (purpose, self.session_id)
             if purpose == 'enroll':
                 value += (self.enrollment.name,)
-            self.worker.commands.put(("purpose", value))
+            self.worker.commands.put(("cancel_enrollment" if cancel_enrollment else "purpose", value))
+        return True
 
     def _tab_changed(self, event=None):
         if self.enrollment is not None:
-            self.cancel_enrollment()
+            if self.tabs.select() != str(self.enroll_tab):
+                self.tabs.select(self.enroll_tab)
             return
         if self.door.phase == "waiting":
             self._set_purpose(self._purpose())
 
     def delete_person(self):
+        if self.enrollment is not None:
+            return
         selected = self.people.curselection()
         if not selected:
             return
@@ -516,7 +557,8 @@ class FaceApp:
             if telemetry.power_mode == "standby":
                 self.indicators.set_stage(3, "절전 · 임베딩 중지")
                 self.indicators.set_stage(1, "절전 · 조건 확인", "yellow")
-            mode_text = "1단계 절전" if telemetry.power_mode == "standby" else "2~4단계 활성"
+            mode_text = ("얼굴등록단계 · FHD 고정" if telemetry.power_mode == 'enrollment' else
+                         "1단계 절전" if telemetry.power_mode == "standby" else "2~4단계 활성")
             width, height = telemetry.processing_size
             details = f"{mode_text}: {width}×{height} / 목표 {telemetry.target_fps} FPS · 실제 처리 {fps:.1f} FPS"
             if telemetry.capture_size is not None:
@@ -528,6 +570,7 @@ class FaceApp:
             count = telemetry.enrollment_count if telemetry else 0
             self.enrollment.samples = [None] * count  # UI progress only; worker owns the real samples
             self.progress['value'] = count
+            self.indicators.set_enrollment(True, count)
             self.status.set(gate_status or '촬영 준비 중')
             if telemetry and telemetry.enrollment_error:
                 error = telemetry.enrollment_error
@@ -725,7 +768,8 @@ class FaceApp:
             pass
         else:
             if self.worker and not self.worker.stop_event.is_set() and self.door.phase == "waiting" and not self.door.completed:
-                self.indicators.phase.set(f"현재 단계: {phase}")
+                self.indicators.phase.set('현재 단계: 얼굴등록 · FHD 고정' if self.enrollment is not None
+                                          else f"현재 단계: {phase}")
         if (self.tabs.index(self.tabs.select()) == 2
                 and time.monotonic() - self.last_history_refresh >= 1):
             self._refresh_history()

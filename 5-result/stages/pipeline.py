@@ -7,7 +7,7 @@ from time import monotonic
 import cv2
 
 from authenticate import authenticate_face
-from capture_control import ACTIVE_PROFILE, STANDBY_PROFILE
+from capture_control import ACTIVE_PROFILE, STANDBY_PROFILE, ENROLLMENT_PROFILE
 from database import initialize_database
 from detection import crop_face
 from face_core import DEFAULT_THRESHOLD
@@ -60,21 +60,29 @@ class FacePipeline:
         self.saved_count = self.store.count_observations()
         self.source, self.progress = source, progress or (lambda text: None)
         self.save_interval = save_interval  # retained for existing UI; an auth pair is always atomic
-        self._threshold = DEFAULT_THRESHOLD
+        self._threshold = float(threshold)
+        if not math.isfinite(self._threshold) or not 0 <= self._threshold <= 1:
+            raise ValueError('인식 기준은 0~1 사이여야 합니다.')
         self.settings = settings if settings is not None else load_guided_settings()
         self.pose_estimator = pose_estimator
         self.session_valid = session_valid or (lambda: True)
         self.session_id = 0
         self.set_purpose(purpose, enrollment_name=enrollment_name)
-        self.threshold = threshold
-        self.mode = 'standby' if start_in_standby else 'active'
+        if purpose != 'enroll':
+            self.mode = 'standby' if start_in_standby else 'active'
 
     @property
     def profile(self):
+        if self.purpose == 'enroll':
+            return ENROLLMENT_PROFILE
         return STANDBY_PROFILE if self.mode == 'standby' else ACTIVE_PROFILE
 
-    def reset_standby(self):
-        self.mode = 'standby'
+    @property
+    def enrollment_locked(self):
+        return getattr(self, 'purpose', None) == 'enroll' and not getattr(self, 'terminal', False)
+
+    def _reset_state(self):
+        self.mode = 'enrollment' if self.purpose == 'enroll' else 'standby'
         self.watcher = FaceWatcher(self.gate_settings)
         self.challenge = None
         self.identity = self.reference_embedding = None
@@ -82,7 +90,15 @@ class FacePipeline:
         self.active_started = None
         self.pose_origin = None
 
-    def set_purpose(self, purpose, session_id=None, enrollment_name=None):
+    def reset_standby(self):
+        if self.purpose == 'enroll':
+            return False
+        self._reset_state()
+        return True
+
+    def set_purpose(self, purpose, session_id=None, enrollment_name=None, cancel_enrollment=False):
+        if self.enrollment_locked and not cancel_enrollment:
+            return False
         if purpose not in ('authenticate', 'enroll', 'preview', 'departure'):
             raise ValueError('잘못된 카메라 사용 목적')
         if purpose == 'enroll' and (not isinstance(enrollment_name, str)
@@ -92,7 +108,8 @@ class FacePipeline:
         self.enrollment_requested_at = monotonic() if purpose == 'enroll' else None
         if session_id is not None:
             self.session_id = session_id
-        self.reset_standby()
+        self._reset_state()
+        return True
 
     @property
     def threshold(self):
@@ -104,6 +121,8 @@ class FacePipeline:
         if not math.isfinite(value) or not 0 <= value <= 1:
             raise ValueError('인식 기준은 0~1 사이여야 합니다.')
         if value != self._threshold:
+            if self.enrollment_locked:
+                return
             self._threshold = value
             self.reset_standby()
 
@@ -171,7 +190,12 @@ class FacePipeline:
         if (self.purpose == 'enroll' and self.enrollment_requested_at is not None
                 and now-self.enrollment_requested_at >= self.settings.enroll_timeout):
             return self._failure(profile, [], '등록 촬영 시간 초과 · 다시 시작하세요')
-        detections = self.engine.detect(frame, size=profile.size)
+        if self.purpose == 'enroll' and (frame.shape[1], frame.shape[0]) != ENROLLMENT_PROFILE.size:
+            raise RuntimeError('얼굴등록단계는 1920×1080 FHD 영상에서만 진행합니다.')
+        # Keep the captured/retained photo FHD; YuNet maps its cheaper input back
+        # to original FHD coordinates, including all five landmarks.
+        detection_size = ACTIVE_PROFILE.size if self.purpose == 'enroll' else profile.size
+        detections = self.engine.detect(frame, size=detection_size)
         if self.purpose == 'departure':
             return self._result(profile, detections, '화면에서 벗어나 주세요')
         if self.mode == 'standby':
@@ -191,7 +215,8 @@ class FacePipeline:
         if len(detections) != 1:
             if self.challenge:
                 return self._failure(profile, detections, '얼굴 소실 또는 여러 얼굴 · 다시 시작하세요')
-            self.reset_standby()
+            if self.purpose != 'enroll':
+                self.reset_standby()
             return self._result(profile, detections, '얼굴은 한 명만 보여주세요')
         try:
             if self.active_started is None:
@@ -204,7 +229,8 @@ class FacePipeline:
             if self.challenge is None:
                 self.watcher.update(frame, detections)
                 if not self.watcher.ready:
-                    self.reset_standby()
+                    if self.purpose != 'enroll':
+                        self.reset_standby()
                     return self._result(profile, detections, '정면에서 촬영 준비를 다시 확인합니다')
                 if self.purpose == 'preview':
                     result = self._result(profile, detections, '등록 준비 완료 · 이름을 입력하고 등록하세요')
