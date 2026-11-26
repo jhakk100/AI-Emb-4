@@ -6,3 +6,4 @@ stages/data/
 __pycache__/
 stages/models/*.onnx
 stages/models/*.part
+stages/models/*.task

@@ -1,5 +1,6 @@
 # Recreate Python environments from requirements.txt.
 .venv/
+.venv-pi/
 venv/
 __pycache__/
 *.py[cod]
@@ -11,3 +12,4 @@ __pycache__/
 # Download and verify models with 임시통합/models.py.
 /임시통합/models/*.onnx
 /임시통합/models/*.part
+/work/

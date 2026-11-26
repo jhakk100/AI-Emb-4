@@ -21,6 +21,9 @@ ACTIVE_PROFILE = CaptureProfile("active", (640, 480), 20)
 
 def configure_capture(capture, size, fps):
     """A device may reject these requests; software limits remain mandatory."""
+    if hasattr(capture, "configure_profile"):
+        capture.configure_profile(size, fps)
+        return
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
     capture.set(cv2.CAP_PROP_FPS, fps)

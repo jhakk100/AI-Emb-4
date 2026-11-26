@@ -125,15 +125,22 @@ class Stage5Cycle:
         self.reset()
 
     def reset(self):
-        # 화면 쪽 상태만 초기화. 진행 중인 5단계 처리(문 열림·잠금)는 스레드에서 끝까지 마친다.
+        if self.processing:
+            return False
         self.phase = 'waiting'
         self.completed = False
+        return True
 
-    def start(self, now, name, score, frame=None, auth_ms=None):
+    @property
+    def processing(self):
+        return self._worker is not None and self._worker.is_alive()
+
+    def start(self, now, name, score, frame=None, auth_ms=None, message=""):
         """4단계 결과 (이름, 점수)로 5단계 시작. 이미 처리 중이면 False."""
         if self.phase != 'waiting' or self.completed or (self._worker and self._worker.is_alive()):
             return False
         auth = stage5.from_stage4((name, score), frame=frame, auth_ms=auth_ms)
+        auth.message = message
         self.last_result = auth
         self._outcome = {}
         self.manual_started = None
@@ -181,4 +188,10 @@ class Stage5Cycle:
         return self.button.press()
 
     def close(self):
+        self.cancel()
+        if self._worker is not None:
+            self._worker.join()
         self.handler.close()
+
+    def cancel(self):
+        self.handler.cancel_event.set()

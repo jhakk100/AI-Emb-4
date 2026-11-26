@@ -19,3 +19,12 @@ top-level repository license and individual model licenses are distinct.
 - Upstream license: https://github.com/opencv/opencv_zoo/blob/main/models/face_recognition_sface/LICENSE
 
 Python dependency licenses are included with their installed distributions.
+
+## MediaPipe Face Landmarker
+
+- Source: https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker
+- Versioned task: https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+- SHA-256: `64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff`
+- The bundle is downloaded unchanged; Face Landmarker model documentation lists
+  Apache-2.0 licensing. MediaPipe source: https://github.com/google-ai-edge/mediapipe
+- Mesh coordinates/pose are predictions from RGB, not measured physical depth.

@@ -4,6 +4,7 @@
 # 성공: 초록 지속. 실패: 빨강 + 부저. 3회 실패: 빨강 깜빡임 + 버튼 대기. (대기 흰색·준비 노랑은 1단계)
 
 from dataclasses import dataclass
+from contextlib import ExitStack
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -185,7 +186,11 @@ class Speaker:
     """음성을 하나씩 순서대로 재생(겹침 방지). 스피커/TTS가 없어도 처리는 계속된다."""
     def __init__(self, enabled):
         self.enabled = enabled and sys.platform != 'win32'
-        self._queue = queue.Queue()
+        self._queue = queue.Queue(maxsize=4)
+        self._stop = threading.Event()
+        self._process_lock = threading.Lock()
+        self._process = None
+        self._prompt_version = 0
         self._warned = False
         self._thread = None
         if self.enabled:
@@ -194,29 +199,75 @@ class Speaker:
 
     def say(self, key):
         if self.enabled:
-            self._queue.put(key)
+            self._prompt_version += 1  # Final result invalidates pending motion prompts.
+            self._enqueue(key)
+
+    def say_text(self, text):
+        if self.enabled:
+            # Challenge prompts are generated internally, never shell commands.
+            self._prompt_version += 1
+            self._enqueue(('text', self._prompt_version, text))
+
+    def _enqueue(self, item):
+        if self._stop.is_set():
+            return
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                pass
 
     def _worker(self):
         while True:
             key = self._queue.get()
-            if key is None:  # close() 신호
+            if key is None or self._stop.is_set():
                 return
-            wav = SOUND_DIR / f'{key}.wav'
+            if isinstance(key, tuple) and key[1] != self._prompt_version:
+                continue
+            text = key[2] if isinstance(key, tuple) else MESSAGES[key]
+            wav = SOUND_DIR / f'{key}.wav' if isinstance(key, str) else SOUND_DIR / '__prompt__.wav'
             command = (['aplay', '-q', str(wav)] if wav.is_file()
-                       else ['espeak-ng', '-v', 'ko', MESSAGES[key]])
+                       else ['espeak-ng', '-v', 'ko', text])
             try:
-                subprocess.run(command, timeout=15, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, check=True)
+                with self._process_lock:
+                    if self._stop.is_set():
+                        return
+                    process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                               stderr=subprocess.DEVNULL)
+                    self._process = process
+                code = process.wait(timeout=15)
+                if code:
+                    raise subprocess.CalledProcessError(code, command)
             except (OSError, subprocess.SubprocessError) as exc:
-                if not self._warned:  # 같은 안내는 한 번만
+                if not self._warned and not self._stop.is_set():
                     self._warned = True
                     print(f'안내: 음성 출력 실패 ({exc})', file=sys.stderr)
+            finally:
+                with self._process_lock:
+                    if self._process is not None and self._process.poll() is None:
+                        self._process.kill()
+                        self._process.wait(timeout=1)
+                    self._process = None
 
     def close(self):
-        # 남은 안내까지 재생한 뒤 종료(각 재생 최대 15초).
+        self._stop.set()
         if self._thread is not None:
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
             self._queue.put(None)
-            self._thread.join()
+            with self._process_lock:
+                if self._process is not None and self._process.poll() is None:
+                    self._process.terminate()
+            self._thread.join(timeout=2)
             self._thread = None
 
 
@@ -229,6 +280,7 @@ class ResultHandler:
         self.button = button if button is not None else (KeyboardButton() if keyboard_button else None)
         self.voice = Speaker(self.settings['enable_voice'])
         self.fail_count = 0
+        self.cancel_event = threading.Event()
         self.last_fail = None
         self._log_lock = threading.Lock()
         self.snapshot_dir = self.settings['log_path'].parent / 'snapshots'
@@ -246,6 +298,8 @@ class ResultHandler:
     def handle(self, result):
         if not isinstance(result, AuthResult) or not isinstance(result.status, AuthStatus):
             raise RuntimeError('4단계 결과는 AuthResult(status=AuthStatus.…)여야 합니다.')
+        if self.cancel_event.is_set():
+            return Action.LOCKED
         if (self.last_fail is not None
                 and time.monotonic() - self.last_fail > self.settings['session_timeout']):
             self.reset_session()  # 이전 사람의 실패 횟수가 다음 사람에게 넘어가지 않게
@@ -259,7 +313,7 @@ class ResultHandler:
         self.voice.say('success')
         snap = self._snapshot('success', result) if self.settings['snapshot_on_success'] else ''
         self._log('AUTH_SUCCESS', result, retry=0, snapshot=snap, note=result.message or 'door open')
-        time.sleep(self.settings['unlock_seconds'])
+        self.cancel_event.wait(self.settings['unlock_seconds'])
         self._off()
         return Action.OPENED
 
@@ -272,7 +326,7 @@ class ResultHandler:
         self._log('AUTH_FAIL', result, retry=self.fail_count, snapshot=snap, note=result.message)
         if self.fail_count < self.settings['max_retries']:
             self.voice.say('retry')
-            time.sleep(1)
+            self.cancel_event.wait(1)
             self._off()
             return Action.RETRY
         return self._manual()
@@ -290,15 +344,17 @@ class ResultHandler:
                                off_color=(0, 0, 0), background=True)
             self.voice.say('manual')
             for _ in range(self.settings['alarm_beeps']):
-                if pressed_event.is_set():
+                if pressed_event.is_set() or self.cancel_event.is_set():
                     break
                 self._beep(0.2)
-                time.sleep(0.2)
-            if self.button is not None:
-                pressed = pressed_event.wait(timeout=self.settings['manual_timeout'])
-            else:
-                time.sleep(self.settings['manual_timeout'])
-                pressed = False
+                self.cancel_event.wait(0.2)
+            deadline = time.monotonic() + self.settings['manual_timeout']
+            while not pressed_event.is_set() and not self.cancel_event.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.cancel_event.wait(min(0.05, remaining))
+            pressed = pressed_event.is_set() and not self.cancel_event.is_set()
         finally:
             if self.button is not None:
                 self.button.when_pressed = None
@@ -307,7 +363,7 @@ class ResultHandler:
         if pressed:
             self._color((0, 1, 0))
             self._log('MANUAL_OPEN', note='button override')
-            time.sleep(self.settings['unlock_seconds'])
+            self.cancel_event.wait(self.settings['unlock_seconds'])
             self._off()
             return Action.MANUAL_OPEN
         self.voice.say('locked')
@@ -324,15 +380,15 @@ class ResultHandler:
 
     def _beep(self, seconds):
         if self.buzzer is None:
-            time.sleep(seconds)
+            self.cancel_event.wait(seconds)
             return
         if self.settings['buzzer_type'] == 'passive':
             self.buzzer.play(880.0)  # 수동 부저는 주파수를 줘야 소리남
-            time.sleep(seconds)
+            self.cancel_event.wait(seconds)
             self.buzzer.stop()
         else:
             self.buzzer.on()
-            time.sleep(seconds)
+            self.cancel_event.wait(seconds)
             self.buzzer.off()
 
     def _log(self, event, result=None, retry='', snapshot='', note=''):
@@ -377,13 +433,13 @@ class ResultHandler:
             old.unlink(missing_ok=True)
 
     def close(self):
-        try:
-            self._off()
+        self.cancel_event.set()
+        with ExitStack() as cleanup:
+            cleanup.callback(self.voice.close)
             for device in (self.led, self.buzzer, self.button):
                 if device is not None:
-                    device.close()
-        finally:
-            self.voice.close()
+                    cleanup.callback(device.close)
+            self._off()
 
 
 def run_demo(handler):

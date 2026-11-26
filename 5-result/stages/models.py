@@ -13,6 +13,30 @@ MODELS = (
      "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79"),
 )
 
+LANDMARKER_SHA256 = "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"
+
+
+def ensure_landmarker(progress=print):
+    """Download a versioned official task bundle; never trust an unverified model."""
+    MODEL_DIR.mkdir(exist_ok=True)
+    path = MODEL_DIR / "face_landmarker.task"
+    if path.is_file() and sha256(path) == LANDMARKER_SHA256:
+        return path
+    partial = path.with_suffix(".part")
+    url = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+           "face_landmarker/float16/1/face_landmarker.task")
+    progress("Face Mesh 모델 다운로드 (약 3.8 MB)")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response, partial.open("wb") as out:
+            while chunk := response.read(1024 * 1024):
+                out.write(chunk)
+        if sha256(partial) != LANDMARKER_SHA256:
+            raise ValueError("Face Mesh 모델 무결성 검증 실패")
+        partial.replace(path)
+    finally:
+        partial.unlink(missing_ok=True)
+    return path
+
 
 def sha256(path):
     with Path(path).open("rb") as stream:
@@ -49,4 +73,5 @@ def ensure_models(progress=print):
 
 if __name__ == "__main__":
     ensure_models()
+    ensure_landmarker()
     print("Models ready.")

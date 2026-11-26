@@ -1,5 +1,5 @@
 # Raspberry Pi 5 8GB / Windows: 1~5단계 통합 실행 (5단계 담당: 결과 처리 + 통합).
-# 1~4단계는 같은 폴더 stages/의 모듈(임시통합 11/7 버전에서 복사, 내용 수정 없음)을 쓰고,
+# 1~4단계와 단일 카메라 동작 검사는 같은 폴더 stages/의 모듈을 쓰고,
 # 결과는 5-result.py로 처리한다. 임시통합 폴더가 없어도 5-result 폴더만으로 동작한다.
 #   1단계 standby.FaceWatcher      : 320×180 / 5fps 절전 검사, 위치·정면·크기·0.8초 유지
 #   2단계 detection.detect_faces   : 640×480 활성 모드 YuNet 검출, 원본 좌표 박스 + 특징점 5개
@@ -20,8 +20,10 @@
 #   (노트북: run.bat = run --show --no-gpio --no-voice / Pi: run)
 
 from pathlib import Path
+from contextlib import ExitStack
 import argparse
 import importlib.util
+import math
 import re
 import sys
 import threading
@@ -43,7 +45,7 @@ stage5 = load_stage5()
 
 
 class Stages:
-    """stages/ 1~4단계 모듈 묶음. 모듈을 고치지 않고 import만 한다."""
+    """stages/ 검출·임베딩·동작 검사·인증 모듈 묶음."""
     def __init__(self, threshold=None):
         if not (STAGES_DIR / 'pipeline.py').is_file():
             raise RuntimeError(f'1~4단계 모듈 폴더가 없습니다: {STAGES_DIR}')
@@ -65,10 +67,10 @@ class Stages:
         self.store = database.initialize_database()
         self.threshold = face_core.DEFAULT_THRESHOLD if threshold is None else threshold
 
-    def new_pipeline(self, source):
+    def new_pipeline(self, source, purpose="authenticate"):
         # save_interval: 인증 성공 얼굴 crop을 DB observations에 남기는 최소 간격(임시통합 기본값 1초)
         return self.pipeline_module.FacePipeline(self.engine, store=self.store, source=source,
-                                                 save_interval=1.0, threshold=self.threshold)
+                                                 save_interval=1.0, threshold=self.threshold, purpose=purpose)
 
 
 class Camera:
@@ -184,11 +186,13 @@ def run_stage5(handler, auth, preview=None):
 
 def wait_departure(camera, pipeline, seconds, preview=None):
     # 처리된 사람이 화면에서 seconds초 동안 사라져야 다음 사람 대기 시작(같은 사람 반복 인증 방지)
-    pipeline.reset_standby()
+    pipeline.set_purpose('departure')
     absent_since = None
     while True:
+        started = time.monotonic()
         frame = camera.read(pipeline.profile)
         if frame is None:
+            time.sleep(0.05)
             continue
         result = pipeline.process(frame)
         if preview is not None:
@@ -197,11 +201,12 @@ def wait_departure(camera, pipeline, seconds, preview=None):
         now = time.monotonic()
         if result.detected_count:
             absent_since = None
-            pipeline.reset_standby()
         elif absent_since is None:
             absent_since = now
         elif now - absent_since >= seconds:
+            pipeline.set_purpose('authenticate')
             return
+        time.sleep(camera.control.frame_delay(started, time.monotonic(), pipeline.profile.fps))
 
 
 def cmd_run(args):
@@ -211,7 +216,7 @@ def cmd_run(args):
     settings = dict(stage5.SET5)
     if args.no_voice:
         settings['enable_voice'] = False
-    handler = camera = preview = None
+    handler = camera = preview = pipeline = None
     try:
         handler = stage5.ResultHandler(*stage5.make_devices(settings, enabled=not args.no_gpio),
                                        settings=settings)
@@ -219,6 +224,7 @@ def cmd_run(args):
         pipeline = stages.new_pipeline(f'camera:{args.camera}')
         preview = Preview(stages.cv2) if args.show else None
         led_mode = None
+        last_prompt = None
         print(f'인증 대기 (기준 유사도 {stages.threshold:.2f}): 화면 중앙에서 정면을 봐 주세요. 종료: Ctrl+C',
               file=sys.stderr, flush=True)
         while True:
@@ -227,19 +233,28 @@ def cmd_run(args):
             frame = camera.read(profile)
             if frame is None:
                 pipeline.reset_standby()
+                time.sleep(0.05)
                 continue
             result = pipeline.process(frame)                      # 1~4단계
             auth_ms = (time.monotonic() - started) * 1000
             led_mode = set_wait_led(handler.led, result.power_mode, led_mode)
+            if result.status != last_prompt:
+                print(f'  {result.status}', file=sys.stderr, flush=True)
+                if result.liveness_step:
+                    handler.voice.say_text(result.liveness_step)
+                last_prompt = result.status
             if preview is not None:
                 preview.status(result.status)
                 preview.show(frame, result)
-            attempted = result.ready and len(result.faces) == 1   # 4단계 인증이 실제로 수행된 프레임
+            attempted = result.authentication_attempted
             if not attempted:
                 time.sleep(stages.capture_control.frame_delay(started, time.monotonic(), profile.fps))
                 continue
             auth = stage5.from_stage4((result.authenticated_name, result.match_score),
                                       frame=frame, auth_ms=auth_ms)
+            if result.authenticated_name is not None and not result.liveness_passed:
+                raise RuntimeError('동작 검사 없는 인증 성공은 허용하지 않습니다.')
+            auth.message = result.status
             if preview is not None:
                 ok = auth.status == stage5.AuthStatus.SUCCESS
                 preview.show(frame, result, wait_ms=300, color=(0, 200, 0) if ok else (0, 0, 255),
@@ -256,14 +271,15 @@ def cmd_run(args):
             wait_departure(camera, pipeline, args.departure, preview)
             handler.reset_session()
     finally:
-        try:
-            if camera is not None:
-                camera.release()
-            if handler is not None:
-                handler.close()
-        finally:
+        with ExitStack() as cleanup:
             if preview is not None:
-                preview.close()
+                cleanup.callback(preview.close)
+            if handler is not None:
+                cleanup.callback(handler.close)
+            if pipeline is not None:
+                cleanup.callback(pipeline.close)
+            if camera is not None:
+                cleanup.callback(camera.release)
 
 
 def cmd_enroll(args):
@@ -271,11 +287,11 @@ def cmd_enroll(args):
     stages = Stages(args.threshold)
     enrollment = stages.face_core.Enrollment(args.name)
     target = stages.face_core.REGISTRATION_SAMPLES
-    camera = preview = None
+    camera = preview = pipeline = None
     last_status = None
     try:
         camera = Camera(stages, args.camera, flip=not args.no_flip)
-        pipeline = stages.new_pipeline(f'camera:{args.camera}')
+        pipeline = stages.new_pipeline(f'camera:{args.camera}', purpose='enroll')
         preview = Preview(stages.cv2) if args.show else None
         print(f'등록: {args.name} - 화면 중앙에서 정면을 보고 고개를 조금씩 움직여 주세요 ({target}샘플, 60초)',
               file=sys.stderr, flush=True)
@@ -286,6 +302,7 @@ def cmd_enroll(args):
             profile = pipeline.profile
             frame = camera.read(profile)
             if frame is None:
+                time.sleep(0.05)
                 continue
             result = pipeline.process(frame)
             status = enrollment.accept(result.faces if result.ready else [], time.monotonic())
@@ -299,10 +316,13 @@ def cmd_enroll(args):
                 preview.show(frame, result, banner=f'ENROLL {len(enrollment.samples)}/{target}', color=(255, 0, 255))
             time.sleep(stages.capture_control.frame_delay(started, time.monotonic(), profile.fps))
     finally:
-        if camera is not None:
-            camera.release()
-        if preview is not None:
-            preview.close()
+        with ExitStack() as cleanup:
+            if preview is not None:
+                cleanup.callback(preview.close)
+            if pipeline is not None:
+                cleanup.callback(pipeline.close)
+            if camera is not None:
+                cleanup.callback(camera.release)
     stages.database.add_user(stages.store, args.name, enrollment.samples)
     print(f'등록 완료: {args.name}', flush=True)
 
@@ -347,7 +367,8 @@ def main(argv=None):
     if args.threshold is not None and not 0 <= args.threshold <= 1:
         print('안내: --threshold는 0~1입니다.', file=sys.stderr)
         return 1
-    if getattr(args, 'departure', 1.0) <= 0:
+    departure = getattr(args, 'departure', 1.0)
+    if not math.isfinite(departure) or departure <= 0:
         print('안내: --departure는 0보다 커야 합니다.', file=sys.stderr)
         return 1
     commands = {'run': cmd_run, 'enroll': cmd_enroll, 'users': cmd_users, 'delete': cmd_delete}

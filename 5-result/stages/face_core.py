@@ -153,6 +153,11 @@ class Enrollment:
 
 def open_camera(index, size=(640, 480), fps=20):
     from capture_control import configure_capture
+    if os.name != "nt":
+        from pi_camera import try_open_pi_camera
+        camera = try_open_pi_camera(index, size, fps)
+        if camera is not None:
+            return camera
     backends = (cv2.CAP_DSHOW, cv2.CAP_MSMF) if os.name == "nt" else (cv2.CAP_ANY,)
     for backend in backends:
         capture = cv2.VideoCapture(index, backend)
@@ -168,4 +173,5 @@ def open_camera(index, size=(640, 480), fps=20):
             capture.release()
             raise
         capture.release()
-    raise RuntimeError(f"카메라 {index}를 열 수 없습니다. Windows 카메라 권한과 카메라 번호를 확인하세요.")
+    raise RuntimeError(f"카메라 {index}를 열 수 없습니다. 카메라 번호·권한을 확인하세요. "
+                       "Pi CSI 카메라는 python3-picamera2와 --system-site-packages 환경이 필요합니다.")

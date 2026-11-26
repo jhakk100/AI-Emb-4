@@ -7,7 +7,9 @@
 
 import argparse
 from io import BytesIO
+from contextlib import ExitStack
 import math
+import sqlite3
 from types import SimpleNamespace
 from queue import Empty, Full, Queue
 import threading
@@ -33,7 +35,8 @@ from status_panel import StatusPanel
 
 
 class CameraWorker(threading.Thread):
-    def __init__(self, index, frames, events, stages, save_interval=1.0, threshold=DEFAULT_THRESHOLD):
+    def __init__(self, index, frames, events, stages, save_interval=1.0, threshold=DEFAULT_THRESHOLD,
+                 purpose="authenticate", session_id=0):
         super().__init__(daemon=True)
         self.index, self.frames, self.events = index, frames, events
         self.stop_event = threading.Event()
@@ -41,6 +44,7 @@ class CameraWorker(threading.Thread):
         self.stages, self.commands = stages, Queue()
         self.save_interval = save_interval
         self.threshold = threshold
+        self.purpose, self.session_id = purpose, session_id
 
     def _stage(self, text):
         try:
@@ -53,7 +57,7 @@ class CameraWorker(threading.Thread):
             self.stages.put_nowait(text)
 
     def run(self):
-        capture = None
+        capture = pipeline = None
         try:
             self._stage("모델 준비 / 카메라 연결")
             paths = ensure_models(lambda text: self.events.put(("status", text)))
@@ -62,7 +66,8 @@ class CameraWorker(threading.Thread):
             engine = FaceEngine(*paths)
             pipeline = FacePipeline(engine, source=f"camera:{self.index}",
                                     save_interval=self.save_interval, progress=self._stage,
-                                    threshold=self.threshold)
+                                    threshold=self.threshold, purpose=self.purpose)
+            pipeline.session_id = self.session_id
             self.events.put(("status", f"카메라 {self.index} 연결 중…"))
             configured_profile = pipeline.profile
             capture = open_camera(self.index, size=configured_profile.size, fps=configured_profile.fps)
@@ -81,6 +86,10 @@ class CameraWorker(threading.Thread):
                         pipeline.threshold = value
                     elif setting == "reset_gate":
                         pipeline.reset_standby()
+                    elif setting == "purpose":
+                        purpose, session_id = value
+                        pipeline.set_purpose(purpose, session_id)
+                        self.pause_event.clear()
                 if self.pause_event.is_set():
                     self.stop_event.wait(.05)
                     continue
@@ -128,13 +137,23 @@ class CameraWorker(threading.Thread):
                     except Empty:
                         pass
                     self.frames.put_nowait(packet)
+                if result.authentication_attempted:
+                    # Exactly one terminal packet; never overwrite it with a later frame.
+                    self.pause_event.set()
                 self.stop_event.wait(frame_delay(started, time.monotonic(), profile.fps))
         except Exception as exc:
             self.events.put(("error", str(exc)))
         finally:
-            if capture is not None:
-                capture.release()
-            self.events.put(("stopped", ""))
+            try:
+                with ExitStack() as cleanup:
+                    if pipeline is not None:
+                        cleanup.callback(pipeline.close)
+                    if capture is not None:
+                        cleanup.callback(capture.release)
+            except Exception as exc:
+                self.events.put(("error", f"자원 정리 오류: {exc}"))
+            finally:
+                self.events.put(("stopped", ""))
 
 
 class FaceApp:
@@ -145,6 +164,8 @@ class FaceApp:
         self.frames, self.events = Queue(maxsize=1), Queue()
         self.stages = Queue(maxsize=1)
         self.enrollment = None
+        self.session_id = 0
+        self.closing = False
         self.last_frame_at = 0
         self.gate_ready = False
         self.last_history_refresh = 0
@@ -155,6 +176,7 @@ class FaceApp:
         self.save_activity = tk.StringVar(value="DB 저장 대기")
         self.last_saved_at = 0
         self.last_matched = False
+        self.last_challenge_prompt = None
         self.last_detected_count = 0
         self.last_embedding_errors = 0
         self.has_error = False
@@ -237,10 +259,11 @@ class FaceApp:
         tabs.pack(fill="both", expand=True)
         auth_tab, enroll_tab, history_tab = (ttk.Frame(tabs, padding=8) for _ in range(3))
         self.tabs, self.auth_tab = tabs, auth_tab   # 5단계(출입 처리)는 '인식·기록' 탭에서만
+        tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
         tabs.add(auth_tab, text="인식·기록")
         tabs.add(enroll_tab, text="사용자 등록")
         tabs.add(history_tab, text="수집 기록")
-        ttk.Label(auth_tab, text="대기 조건과 사용자 인증을 모두\n통과한 얼굴만 DB에 저장합니다.\n\n미등록·인증 실패·여러 얼굴은\n저장하지 않습니다. 새 사용자 등록은\n‘사용자 등록’ 탭에서 진행하세요.").pack(anchor="w", pady=8)
+        ttk.Label(auth_tab, text="정면 본인 확인 후 화면 안내대로\n고개를 돌리고 정면으로 돌아오세요.\n무작위 동작과 최종 본인 확인을\n모두 통과해야 출입·저장합니다.").pack(anchor="w", pady=8)
         ttk.Label(auth_tab, textvariable=self.saved_text, style="Result.TLabel").pack(anchor="w", pady=8)
         ttk.Label(auth_tab, text="DB 저장 간격 (초)").pack(anchor="w", pady=(8, 4))
         storage_row = ttk.Frame(auth_tab)
@@ -305,6 +328,8 @@ class FaceApp:
         self.threshold_text.set(f"{threshold:.2f}")
         if self.worker and not self.worker.stop_event.is_set():
             self.worker.commands.put(("threshold", threshold))
+            if self.door.phase == "waiting":
+                self._set_purpose(self._purpose())
 
     def apply_mode(self):
         self.door.mode = self.mode.get()
@@ -349,6 +374,9 @@ class FaceApp:
     def start_camera(self):
         if self.worker is not None:
             return
+        if self.door.processing:
+            self.status.set("진행 중인 결과 처리가 끝난 후 다시 시작하세요.")
+            return
         try:
             index = int(self.camera.get())
             if not 0 <= index <= 9:
@@ -365,6 +393,7 @@ class FaceApp:
         self.last_embedding_errors = 0
         self.last_saved_at = 0
         self.door.reset()
+        self.last_challenge_prompt = None
         self.door.mode = self.mode.get()
         self.door_message.set("문이 닫혀 있습니다. 인증 대기 중입니다.")
         self.power_text.set(self.standby_text + " · 카메라 준비 중")
@@ -375,14 +404,16 @@ class FaceApp:
         self.indicators.phase.set("현재 단계: 모델 준비 / 카메라 연결")
         self.indicators.set_led("white", "카메라 준비 중", blink=True)
         self.worker = CameraWorker(index, self.frames, self.events, self.stages,
-                                   self.applied_save_interval, self.threshold.get())
+                                   self.applied_save_interval, self.threshold.get(),
+                                   self._purpose(), self.session_id)
         self.worker.start()
 
     def stop_camera(self):
         if self.worker is not None:
             if self.door.phase != "waiting":
-                self.door_message.set("문이 닫혔습니다.")
-            self.door.reset()
+                self.status.set("진행 중인 결과 처리를 마친 후 카메라를 중지합니다.")
+                self.worker.stop_event.set()
+                return
             self.worker.stop_event.set()
             self.stop_button.configure(state="disabled")
             self.register_button.configure(state="disabled")
@@ -406,6 +437,7 @@ class FaceApp:
         if name in self.store.people and not messagebox.askyesno("다시 등록", f"‘{name}’의 기존 임베딩을 새로 등록할까요?"):
             return
         self.enrollment = Enrollment(name)
+        self._set_purpose("enroll")
         self.progress["value"] = 0
         self.register_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
@@ -414,13 +446,35 @@ class FaceApp:
         self.status.set("정면을 바라보며 얼굴을 화면에 맞춰주세요.")
 
     def cancel_enrollment(self):
+        was_enrolling = self.enrollment is not None
         self.enrollment = None
+        if was_enrolling:
+            self._set_purpose(self._purpose())
         self.progress["value"] = 0
         self.cancel_button.configure(state="disabled")
         self.name_input.configure(state="normal")
         self.delete_button.configure(state="normal")
         if self.worker and not self.worker.stop_event.is_set() and self.gate_ready:
             self.register_button.configure(state="normal")
+
+    def _purpose(self):
+        if self.enrollment is not None:
+            return "enroll"
+        return "authenticate" if self.tabs.select() == str(self.auth_tab) else "preview"
+
+    def _set_purpose(self, purpose):
+        self.session_id += 1
+        self.gate_ready = False
+        self.last_challenge_prompt = None
+        if self.worker and not self.worker.stop_event.is_set():
+            self.worker.commands.put(("purpose", (purpose, self.session_id)))
+
+    def _tab_changed(self, event=None):
+        if self.enrollment is not None:
+            self.cancel_enrollment()
+            return
+        if self.door.phase == "waiting":
+            self._set_purpose(self._purpose())
 
     def delete_person(self):
         selected = self.people.curselection()
@@ -444,6 +498,9 @@ class FaceApp:
         self.last_detected_count = telemetry.detected_count if telemetry else len(faces)
         self.last_embedding_errors = telemetry.embedding_errors if telemetry else 0
         if telemetry is not None:
+            if telemetry.liveness_step and telemetry.liveness_step != self.last_challenge_prompt:
+                self.door.handler.voice.say_text(telemetry.liveness_step)
+                self.last_challenge_prompt = telemetry.liveness_step
             if telemetry.saved_this_frame:
                 self.last_saved_at = time.monotonic()
             self.save_activity.set("인증 성공 시에만 저장" if telemetry.authenticated_name is None else
@@ -530,17 +587,19 @@ class FaceApp:
                                                  ("저장 완료" if telemetry and telemetry.saved_this_frame else "저장 대기")),
                                       "green" if self.last_matched else "red")
         # 4단계 인증이 실제로 수행된 프레임(조건 통과 + 얼굴 1개)이면 결과를 5단계로 넘김(성공·실패 모두)
-        attempted = (telemetry is not None and self.gate_ready and telemetry.detected_count == 1
-                     and len(faces) == 1)
+        attempted = telemetry is not None and telemetry.authentication_attempted
         on_auth_tab = self.tabs.select() == str(self.auth_tab)
         if attempted and self.enrollment is None and self.worker is not None and not on_auth_tab:
             self.door_message.set("‘사용자 등록’·‘수집 기록’ 탭에서는 출입 처리(5단계)를 하지 않습니다.")
         elif attempted and self.enrollment is None and self.worker is not None and not self.store.people:
             self.door_message.set("등록된 사용자가 없습니다. ‘사용자 등록’ 탭에서 먼저 등록하세요.")
+            self._set_purpose(self._purpose())
         elif attempted and self.enrollment is None and self.worker is not None:
             name, score = telemetry.authenticated_name, telemetry.match_score
+            if name is not None and not telemetry.liveness_passed:
+                raise RuntimeError("동작 검사를 통과하지 않은 성공 결과입니다.")
             if self.door.start(time.monotonic(), name, score, frame=frame,
-                               auth_ms=getattr(telemetry, "process_ms", None)):
+                               auth_ms=getattr(telemetry, "process_ms", None), message=telemetry.status):
                 self.worker.pause_event.set()
                 if name:   # 성공 문구는 임시통합 그대로
                     self.door_message.set("문이 열렸습니다.")
@@ -605,7 +664,7 @@ class FaceApp:
                     self.worker.stop_event.set()
                     self.stop_button.configure(state="disabled")
                 else:
-                    self.worker.commands.put(("reset_gate", None))
+                    self._set_purpose(self._purpose())
                     self.worker.pause_event.clear()
             self.register_button.configure(state="disabled")
 
@@ -634,6 +693,20 @@ class FaceApp:
             self.indicators.set_led("white", "1단계 · 카메라 준비 / 얼굴 대기", blink=True)
 
     def _poll(self):
+        if self.closing:
+            return
+        try:
+            self._poll_once()
+        except (sqlite3.Error, OSError, ValueError, RuntimeError) as exc:
+            self.has_error = True
+            self.status.set(f"처리 오류: {exc}")
+            if self.worker:
+                self.worker.stop_event.set()
+        finally:
+            if not self.closing:
+                self.root.after(40, self._poll)
+
+    def _poll_once(self):
         self._advance_door()
         try:
             phase = self.stages.get_nowait()
@@ -642,7 +715,8 @@ class FaceApp:
         else:
             if self.worker and not self.worker.stop_event.is_set() and self.door.phase == "waiting" and not self.door.completed:
                 self.indicators.phase.set(f"현재 단계: {phase}")
-        if time.monotonic() - self.last_history_refresh >= 1:
+        if (self.tabs.index(self.tabs.select()) == 2
+                and time.monotonic() - self.last_history_refresh >= 1):
             self._refresh_history()
             self.last_history_refresh = time.monotonic()
         while True:
@@ -682,28 +756,33 @@ class FaceApp:
                 pass
             else:
                 if self.door.phase == "waiting" and not self.door.completed:
-                    self._handle_frame(*packet)
+                    if packet[-1].session_id == self.session_id:
+                        self._handle_frame(*packet)
             if self.door.phase == "waiting" and self.last_frame_at and time.monotonic() - self.last_frame_at > 2:
                 self.register_button.configure(state="disabled")
                 self.result.set("카메라 영상을 기다리고 있습니다…")
                 self._placeholder("카메라 영상을 기다리고 있습니다…")
         self._update_led()
-        self.root.after(40, self._poll)
 
     def close(self):
-        self.door.close()   # 5단계 장치(LED·부저·버튼)·음성 정리
+        self.closing = True
+        self.root.withdraw()
+        self.door.cancel()
         if self.worker:
             self.worker.stop_event.set()
             # Keep the process alive until the capture is released.
-            self.root.withdraw()
             self._wait_for_close()
         else:
-            self.root.destroy()
+            self._wait_for_close()
 
     def _wait_for_close(self):
         if self.worker and self.worker.is_alive():
             self.root.after(50, self._wait_for_close)
         else:
+            if self.door.processing:
+                self.root.after(50, self._wait_for_close)
+                return
+            self.door.close()
             self.root.destroy()
 
 

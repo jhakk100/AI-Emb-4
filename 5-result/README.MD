@@ -7,19 +7,118 @@
 1. `setup.bat` : 처음 한 번 설치 (Python 3.12 이상)
 2. `run.bat` : 통합 화면 실행 → **카메라 시작**
 3. **사용자 등록** 탭 : 이름 입력 → 등록 버튼 → 정면을 보며 15샘플
-4. **인식·기록** 탭 : 정면 응시 → 등록자 `OPENED`, 미등록 `RETRY` 3번 후 **수동 개방 버튼** 대기 → `LOCKED`
+4. **인식·기록** 탭 : 정면 본인 확인 → 화면 안내에 따라 무작위 좌우 회전 2회(각 회전 사이 정면 복귀) → 정면 본인 재확인 → `OPENED`. 실패는 `RETRY` 3번 후 기존 수동 개방/잠금 처리.
 
 ## 실행 방법 (라즈베리파이)
 
 ```bash
-sudo apt install -y python3-tk python3-gpiozero python3-lgpio espeak-ng
-python3 -m venv --system-site-packages 5-result/.venv
-5-result/.venv/bin/pip install -r 5-result/requirements.txt
-5-result/.venv/bin/python 5-result/stages/models.py
-5-result/.venv/bin/python 5-result/app.py                        # 화면 있을 때
-5-result/.venv/bin/python 5-result/integrate.py run              # 화면 없을 때 (등록: integrate.py enroll --name 이름)
+cd 5-result
+bash setup_pi.sh                        # 처음 한 번: 설치 + 모델 준비 + 실행 점검
+bash run_pi.sh check --camera 0          # 카메라 촬영/해제 확인 (DB 저장 없음)
+bash run_pi.sh                          # 화면이 있으면 GUI, 없으면 콘솔 인증
+
+# 화면 없이 사용할 때 먼저 등록
+bash run_pi.sh enroll --name "홍길동"
+bash run_pi.sh run                      # Ctrl+C 종료
+# 기타: gui / users / delete --name "홍길동" / check --models / test
 ```
 핀 번호는 `set5.json`에서 배선에 맞게 수정
+
+`setup_pi.sh`는 OS·CPU·Python 호환성을 먼저 확인하고 필요한 시스템 패키지,
+Pi 전용 가상환경 `.venv-pi`, Python 패키지, 모델 3종을 준비합니다. 설치 시
+인터넷과 시스템 패키지 설치 권한이 필요합니다. 카메라는 자동으로 켜지지
+않으며 `check --camera` 또는 앱에서 명시적으로 시작할 때 사용합니다.
+Windows의 `.venv`는 Pi에서 재사용하지 않습니다. 얼굴 DB·모델·설정 경로는
+기존과 같으므로 `.venv-pi`를 새로 만들어도 등록 정보를 옮길 필요가 없습니다.
+스크립트는 저장소 밖의 경로에서 호출해도 해당 `5-result` 폴더를 기준으로
+실행합니다. `.sh` 파일은 Git에서 LF 줄바꿈으로 유지합니다.
+
+환경 변수 `PYTHON_BIN`으로 설치에 사용할 Python을 지정할 수 있지만, 해당
+인터프리터에서 apt로 설치한 Picamera2/libcamera를 불러올 수 있어야 합니다.
+가상환경 위치를 바꾸려면 설치·실행 양쪽에서 같은 `FACE_ACCESS_VENV`를
+지정하세요. 현재 OS가 Python 3.13 이상이면 설치가 시스템 변경 전에 중단되며,
+지원 환경인 64비트 Raspberry Pi OS Bookworm(Python 3.11)을 안내합니다.
+
+Pi는 **64비트 Raspberry Pi OS / Python 3.11 또는 3.12**를 기준으로 합니다.
+`requirements.txt`는 ARM에서 MediaPipe 0.10.18 + NumPy 1.26.4 + OpenCV contrib
+4.11을 선택합니다. Windows/x86에서는 MediaPipe 0.10.35 + NumPy 2 + OpenCV
+contrib 4.13을 사용합니다. 0.10.35에는 Linux ARM 배포 파일이 없으므로 같은
+버전을 Pi에 강제로 설치하지 마세요. Pi Python 3.13 이상과 32비트 OS는 이
+설치 조합의 지원 대상이 아닙니다. CSI 카메라는 Picamera2를 자동 사용하며,
+Windows/USB 카메라는 기존 OpenCV 방식으로 연결합니다. `opencv-python`과
+`opencv-contrib-python`을 함께 설치하지 않습니다. 기존 Windows 환경은
+`setup.bat`을 다시 실행하면 OpenCV 중복 설치를 정리합니다.
+
+## 단일 카메라 인증 구조
+
+```text
+YuNet 절전 대기 (320×180 / 5FPS)
+  → 활성 영상 (640×480 / 목표 20FPS)
+  → 선명한 정면 얼굴의 SFace 임베딩으로 등록자 확인
+  → Face Mesh로 정면 → 무작위 좌/우 → 정면 → 무작위 좌/우 → 정면 확인
+  → 검사 도중 같은 얼굴 추적 + 주기적인 임베딩 재검사
+  → 마지막 정면 프레임에서 본인 재확인
+  → 성공 결과 1회 전달 + 인증된 Crop 저장 → 기존 5단계 결과 처리
+```
+
+회전 검사 중에는 standby의 정면 조건을 다시 적용하지 않습니다. 각 자세는
+최소 3프레임·0.25초 유지해야 하며, 단계당 7초 / 전체 25초가 기본 제한입니다.
+얼굴 소실, 여러 얼굴, 0.7초를 넘는 관측 간격, 급격한 위치 변화, 등록자 변경,
+검사 시간 초과는 실패 처리합니다. 카메라 읽기 실패는 검사 상태를 버리고,
+연속 10회 실패하면 자원을 해제하며 중지합니다. 실패가 반복되면 기존
+5단계 재시도 정책을 사용합니다.
+
+Face Mesh는 활성 인증에서만 실행하고 모델은 한 번 생성해 재사용합니다.
+SFace는 동작 중 기본 0.3초 간격으로 실행하며 마지막 정면 구간은 매 프레임
+재검사합니다. 프레임 큐는 최신 1개만 유지하고, 최종 결과는 덮어쓰지 않고
+소비를 기다립니다. 등록/미리보기/인증의 목적을 분리하고, 탭·기준값 변경 시
+세션 번호를 바꾸어 이전 프레임이 새 인증에 사용되지 않도록 합니다.
+
+사용자 등록은 신뢰할 수 있는 운영자가 직접 하는 기존 15샘플 절차입니다.
+등록 탭과 수집 기록 탭에서는 출입 처리나 관측 사진 자동 저장을 하지 않습니다.
+등록 중 취소·화면 전환·카메라 중지 시 진행 중인 인증 상태도 초기화됩니다.
+등록 DB에는 SFace 임베딩을 저장하며 Face Mesh를 실제 3D 형상으로 저장하지 않습니다.
+
+설정은 `stages/liveness.json`에서 변경합니다. 좌/우는 **미리보기 화면 기준**이며
+화면과 분석에 같은 반전을 적용합니다. 실제 카메라에서 표시 방향과 동작이
+반대라면 `yaw_sign`을 `-1`로 설정합니다. 각도·시간은 실기기에서 조정할
+시작값이며 보안 성능이 검증된 임계값이 아닙니다. 화면 없는 실행은 콘솔과
+음성(활성화 시)으로 동작을 안내합니다.
+
+**보안 범위:** 무작위 동작 검사는 정지 사진/단순 재생 공격에 대한 방어를
+추가하지만 실제 깊이 측정이나 검증된 전용 PAD를 대체하지 않습니다.
+Face Mesh도 사진에 특징점을 추정할 수 있으므로, 기울인/구부린 사진,
+동작별 영상 재생, 실시간 합성, 마스크를 차단한다고 보장하지 않습니다.
+실제 얼굴과 인쇄물·휴대폰 사진·영상으로 오인증/거절률을 측정해야 합니다.
+
+## 검증 명령
+
+```powershell
+cd 5-result
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe integrate.py --help
+```
+
+`tests/test_secure_pipeline.py`: 임베딩과 동작 검사 연결, 시간 초과, 얼굴 변경,
+소실, 중복 성공 방지, 등록과 인증 분리. `tests/test_runtime.py`: GUI 세션 전환,
+실패 결과 전달, 카메라/모델 해제, Picamera2 프로필 변경과 오류 정리.
+테스트는 모의 자세/카메라를 사용하므로 실제 위조 방지 성능을 입증하지 않습니다.
+실제 카메라로는 정면 안내 → 요청 방향 회전 → 정면 복귀가 되는지, 사진 이동/
+기울이기/영상 재생이 통과하는지, 연속 재시도·중지·재시작을 확인해야 합니다.
+
+`tests/test_pi_setup.py`: 지원 환경 사전 검사, 카메라 오류 시 해제,
+실행 스크립트의 화면 없는 기본 실행 및 공백·한글 이름 전달을 확인합니다.
+화면 없는 Pi에서는 GUI 테스트만 건너뛰고 나머지 테스트를 실행합니다.
+
+2026-11-26 Windows 검증: 통합 실행본 테스트 41개 통과, 이전 `임시통합` 회귀 테스트
+40개 통과, 의존성 검사 통과. 실제 YuNet/SFace/Face Landmarker 모델에 저장된
+샘플 사진을 반복 입력했을 때 동작 시간 초과로 거절되고 관측 DB 저장 0건임을
+확인했습니다. ARM Python 3.11용 패키지 설치 조합은 교차 의존성 해석으로
+확인했습니다. Pi 실기기 실행·전력·카메라 촬영·사진/영상 공격 실험은 아직
+수행하지 않았습니다.
+
+변경은 현재 1~5단계 실행본인 `5-result`에 적용했습니다. `임시통합` 및 단계별
+실험 폴더는 이전 비교용 코드로 남아 있으며 새 인증의 실행 경로가 아닙니다.
 
 ## 시행착오
 
