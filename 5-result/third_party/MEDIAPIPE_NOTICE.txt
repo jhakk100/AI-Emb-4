@@ -1,0 +1,10 @@
+face_topology.json contains triangle indices derived from
+MediaPipe FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION in
+mediapipe/tasks/python/vision/face_landmarker.py.
+
+Copyright 2023 The MediaPipe Authors.
+Licensed under the Apache License, Version 2.0.
+See MEDIAPIPE_LICENSE.txt for the license text.
+
+This project deduplicates triangle edges for wireframe rendering and uses
+the first 468 face landmarks. No MediaPipe model weights are included here.

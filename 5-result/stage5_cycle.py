@@ -122,10 +122,11 @@ class Stage5Cycle:
         self._worker = None
         self._outcome = {}
         self.manual_started = None
+        self._suspended = False
         self.reset()
 
     def reset(self):
-        if self.processing:
+        if self.processing or self._suspended:
             return False
         self.phase = 'waiting'
         self.completed = False
@@ -137,7 +138,7 @@ class Stage5Cycle:
 
     def start(self, now, name, score, frame=None, auth_ms=None, message=""):
         """4단계 결과 (이름, 점수)로 5단계 시작. 이미 처리 중이면 False."""
-        if self.phase != 'waiting' or self.completed or (self._worker and self._worker.is_alive()):
+        if self._suspended or self.phase != 'waiting' or self.completed or (self._worker and self._worker.is_alive()):
             return False
         auth = stage5.from_stage4((name, score), frame=frame, auth_ms=auth_ms)
         auth.message = message
@@ -172,7 +173,7 @@ class Stage5Cycle:
 
     def advance(self, now):
         """처리가 끝났으면 'retry' / 'reset' / 'finished' 중 하나, 아직이면 None."""
-        if self.phase != 'processing' or (self._worker and self._worker.is_alive()):
+        if self._suspended or self.phase != 'processing' or (self._worker and self._worker.is_alive()):
             return None
         self.phase = 'waiting'
         if 'error' in self._outcome:
@@ -185,7 +186,18 @@ class Stage5Cycle:
         return 'finished' if self.completed else 'reset'
 
     def press_manual(self):
+        if self._suspended:
+            return False
         return self.button.press()
+
+    def suspend(self):
+        if self.phase != 'waiting' or self.processing:
+            return False
+        self._suspended = True
+        return True
+
+    def resume(self):
+        self._suspended = False
 
     def close(self):
         self.cancel()

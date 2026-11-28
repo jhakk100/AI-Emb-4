@@ -25,6 +25,7 @@ class StatusPanel(ttk.Frame):
         row.pack(fill="x")
         self.details, self.stage_labels = [], []
         self.stage5_color = "off"
+        self.enrollment_active = False
         for index, title in enumerate(("1 · 대기 조건", "2 · 검출 / Crop", "3 · 임베딩", "4 · DB / 인증", "5 · 결과 처리")):
             card = ttk.Frame(row, padding=(7, 4))
             card.grid(row=0, column=index, sticky="nsew", padx=(0, 4))
@@ -35,13 +36,11 @@ class StatusPanel(ttk.Frame):
             label.pack(anchor="w")
             self.details.append(detail)
             self.stage_labels.append(label)
-        self.enrollment_detail = tk.StringVar(value='별도 단계 · 얼굴등록 대기')
-        ttk.Label(self, textvariable=self.enrollment_detail, foreground='#7e22ce',
-                  wraplength=640).pack(anchor='w', pady=(5, 0))
-
-    def set_enrollment(self, active, count=0):
-        self.enrollment_detail.set(f'얼굴등록단계 · FHD 1920×1080 고정 · {count}/15장 · 다른 단계 이동 잠금'
-                                   if active else '별도 단계 · 얼굴등록 대기')
+    def set_enrollment(self, active):
+        if active and not self.enrollment_active:
+            for stage in range(1, 6):
+                self.set_stage(stage, '등록 중 · 실행 안 함')
+        self.enrollment_active = active
         if active:
             self.phase.set('현재 단계: 얼굴등록 · FHD 고정')
 
@@ -51,6 +50,8 @@ class StatusPanel(ttk.Frame):
         self.tick()
 
     def set_stage(self, stage, detail, color="off"):
+        if self.enrollment_active:
+            return
         self.details[stage - 1].set(detail)
         text_colors = {"off": "#64748b", "white": "#64748b", "yellow": "#a16207",
                        "blue": "#0369a1", "green": "#15803d", "red": "#be123c", "purple": "#7e22ce"}
@@ -59,6 +60,8 @@ class StatusPanel(ttk.Frame):
             self.stage5_color = color
 
     def idle(self, text="카메라 시작 대기"):
+        if self.enrollment_active:
+            return
         self.set_enrollment(False)
         self.phase.set(f"현재 단계: {text}")
         self.set_led("off", text)

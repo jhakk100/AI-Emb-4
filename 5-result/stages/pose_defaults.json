@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "enabled": true,
+  "name": "종학",
+  "preset": "pose_presets/jonghak.json"
+}

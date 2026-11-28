@@ -17,7 +17,7 @@ from detection import detect_faces
 MODEL_ID = "opencv-sface-2021dec"
 EMBEDDING_SIZE = 128
 DEFAULT_THRESHOLD = 0.45
-REGISTRATION_SAMPLES = 15
+REGISTRATION_SAMPLES = 12
 
 
 def normalize(vector):
@@ -82,14 +82,16 @@ class FaceStore:
         del people[name]
         self._write(people)
 
-    def match(self, embedding, threshold=DEFAULT_THRESHOLD):
+    def match(self, embedding, threshold=DEFAULT_THRESHOLD, *, exclude=()):
         if not 0 <= threshold <= 1:
             raise ValueError("인식 기준은 0~1 사이여야 합니다.")
         if not self.people:
             return None, None
         query = normalize(embedding)
         scores = [(name, float(np.clip(query @ np.asarray(person["embedding"], dtype=np.float32), -1, 1)))
-                  for name, person in self.people.items()]
+                  for name, person in self.people.items() if name not in exclude]
+        if not scores:
+            return None, None
         name, score = max(scores, key=lambda item: item[1])
         return (name if score >= threshold else None), score
 

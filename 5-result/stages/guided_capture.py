@@ -1,4 +1,4 @@
-"""YuNet guides five poses; only retained snapshots run Face Mesh and embedding."""
+"""YuNet guides four poses; only retained snapshots run Face Mesh and embedding."""
 
 from dataclasses import dataclass, fields
 import json
@@ -13,11 +13,14 @@ from face_core import normalize
 from liveness import Pose
 from models import ROOT
 from standby import overlap_ratio
+from pose_calibration import PoseProfile
 
-DIRECTIONS = ('front', 'up', 'down', 'left', 'right')
-LABELS = {'front': '정면', 'up': '위', 'down': '아래', 'left': '화면 왼쪽', 'right': '화면 오른쪽'}
-ARROWS = {'front': '●', 'up': '↑', 'down': '↓', 'left': '←', 'right': '→'}
+DIRECTIONS = ('front', 'up', 'left', 'right')
+LABELS = {'front': '정면', 'up': '위', 'left': '화면 왼쪽', 'right': '화면 오른쪽'}
+ARROWS = {'front': '●', 'up': '↑', 'left': '←', 'right': '→'}
 MESH_MODEL = 'mediapipe-face-landmarker-v1-eye-scale-468-v1'
+MANUAL_POSE_BASIS = {'kind': 'manual-enrollment', 'version': 1}
+MESH_AUTH_POSE_KIND = 'mesh-authentication'
 FACE_POINTS = np.array([[-32, -28, 20], [32, -28, 20], [0, 0, 0],
                         [-24, 28, 15], [24, 28, 15]], dtype=np.float64)
 
@@ -41,6 +44,8 @@ class GuidedSettings:
     auth_step_timeout: float = 10.
     mesh_limit: float = .12
     depth_limit: float = .08
+    mesh_front_pitch_scale: float = 1.5
+    mesh_side_pitch_scale: float = 1.45
     yaw_sign: int = 1
     pitch_sign: int = 1
 
@@ -56,6 +61,7 @@ class GuidedSettings:
                 and 0 < self.enroll_step_timeout <= self.enroll_timeout <= 300
                 and 0 < self.auth_step_timeout <= self.auth_timeout <= 120
                 and 0 < self.mesh_limit < 1 and 0 < self.depth_limit < 1
+                and 1 <= self.mesh_front_pitch_scale <= 2 and 1 <= self.mesh_side_pitch_scale <= 2
                 and self.yaw_sign in (-1, 1) and self.pitch_sign in (-1, 1)):
             raise ValueError('방향 촬영 설정의 범위가 잘못되었습니다.')
 
@@ -98,9 +104,11 @@ def direction_matches(direction, pose, s):
     if direction in ('left', 'right'):
         signed = yaw if direction == 'right' else -yaw
         return s.yaw_min <= signed <= s.yaw_max and abs(pitch) <= s.cross_degrees
-    if direction in ('up', 'down'):
-        signed = pitch if direction == 'down' else -pitch
+    if direction == 'up':
+        signed = -pitch
         return s.pitch_min <= signed <= s.pitch_max and abs(yaw) <= s.cross_degrees
+    if direction == 'down':
+        return False  # Archived down poses are never accepted by the active workflow.
     raise ValueError('알 수 없는 촬영 방향')
 
 
@@ -136,32 +144,72 @@ class CaptureSample:
     embedding: np.ndarray
     landmarks: np.ndarray
     mesh: np.ndarray
-    pose: Pose
+    pose: Pose | None
     size: tuple
     detection: np.ndarray
     crop_jpeg: bytes
     model: str = MESH_MODEL
+    pose_basis: dict | None = None
+    capture_mode: str = 'auto'
 
 
-def compare_sample(sample, templates, threshold, settings):
-    if not direction_matches(sample.direction, sample.pose, settings):
+def mesh_auth_pose_profile(centers, settings):
+    return PoseProfile(centers, pitch_scales={'front': settings.mesh_front_pitch_scale,
+                                            'left': settings.mesh_side_pitch_scale,
+                                            'right': settings.mesh_side_pitch_scale})
+
+
+def sample_direction_matches(sample, settings):
+    if sample.pose is None or sample.direction not in DIRECTIONS:
+        return False
+    if sample.pose_basis is None:
+        return direction_matches(sample.direction, sample.pose, settings)
+    if not isinstance(sample.pose_basis, dict) or sample.pose_basis.get('version') != 1:
+        return False
+    try:
+        centers = sample.pose_basis['centers']
+        profile = (mesh_auth_pose_profile(centers, settings)
+                   if sample.pose_basis.get('kind') == MESH_AUTH_POSE_KIND else PoseProfile(centers))
+        return profile.classify(sample.pose)[0] == sample.direction
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
+def enrollment_sample_direction_valid(sample, settings):
+    if sample.pose_basis == MANUAL_POSE_BASIS:
+        return sample.direction in DIRECTIONS and sample.pose is None and sample.capture_mode == 'manual'
+    return sample_direction_matches(sample, settings)
+
+
+def template_basis_matches(template_basis, current_basis):
+    return template_basis == MANUAL_POSE_BASIS or template_basis == current_basis
+
+
+def compare_sample(sample, templates, threshold, settings, trace=None):
+    if not sample_direction_matches(sample, settings):
         return None
     candidates = []
-    for template in templates:
+    for index, template in enumerate(templates):
         if template['model'] != sample.model:
             continue
         score = float(np.clip(normalize(sample.embedding) @ normalize(template['embedding']), -1, 1))
         error, depth = mesh_errors(sample.mesh, template['mesh'])
-        if score >= threshold and error <= settings.mesh_limit and depth <= settings.depth_limit:
+        passed = score >= threshold and error <= settings.mesh_limit and depth <= settings.depth_limit
+        if trace is not None:
+            trace('sample', index=index, score=score, shape_error=error, depth_error=depth, passed=passed)
+        if passed:
             candidates.append((score, error, depth))
     return max(candidates, default=None, key=lambda item: item[0])
 
 
 class GuidedCapture:
-    def __init__(self, purpose, settings, now, directions=None):
+    def __init__(self, purpose, settings, now, directions=None, matcher=None):
         self.purpose, self.settings = purpose, settings
+        self.matcher = matcher or (lambda direction, pose: direction_matches(direction, pose, settings))
         self.directions = tuple(directions or (DIRECTIONS if purpose == 'enroll' else
                                  secrets.SystemRandom().sample(DIRECTIONS, 2)))
+        if any(direction not in DIRECTIONS for direction in self.directions):
+            raise ValueError('촬영 방향은 정면·위·좌·우만 사용할 수 있습니다.')
         self.per_direction = 3 if purpose == 'enroll' else 1
         self.samples = []
         self.index = 0
@@ -181,7 +229,7 @@ class GuidedCapture:
         if self.failure:
             return self.failure
         if self.complete:
-            return '5방향 등록 완료' if self.purpose == 'enroll' else '두 방향 사진 검사 완료'
+            return '4방향 등록 완료' if self.purpose == 'enroll' else '두 방향 사진 검사 완료'
         count = sum(sample.direction == self.target for sample in self.samples)
         action = ('정면을 바라봐주세요' if self.target == 'front' else
                   f'고개를 {LABELS[self.target]} 방향으로 돌려주세요')
@@ -204,7 +252,7 @@ class GuidedCapture:
         if self.previous_box is not None and overlap_ratio(self.previous_box, pose.box) < .25:
             return self.fail('얼굴 위치가 급변했습니다 · 다시 시작하세요')
         self.last_seen, self.previous_box = now, pose.box
-        if not direction_matches(self.target, pose, s):
+        if not self.matcher(self.target, pose):
             self.hold_started, self.frames = None, 0
             return False
         if self.hold_started is None:

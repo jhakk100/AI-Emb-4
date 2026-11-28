@@ -43,10 +43,11 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def ensure_models(progress=print):
+def ensure_models(progress=print, *, detector_only=False):
+    """Verify/download OpenCV models; pose tuning requests only the YuNet detector."""
     MODEL_DIR.mkdir(exist_ok=True)
     paths = []
-    for folder, filename, expected in MODELS:
+    for folder, filename, expected in (MODELS[:1] if detector_only else MODELS):
         path = MODEL_DIR / filename
         if not path.exists() or sha256(path) != expected:
             url = f"https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/{folder}/{filename}"

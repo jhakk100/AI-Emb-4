@@ -16,6 +16,8 @@
   "auth_step_timeout": 10.0,
   "mesh_limit": 0.12,
   "depth_limit": 0.08,
+  "mesh_front_pitch_scale": 1.5,
+  "mesh_side_pitch_scale": 1.45,
   "yaw_sign": 1,
   "pitch_sign": 1
 }

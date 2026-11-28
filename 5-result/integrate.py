@@ -1,7 +1,7 @@
 # Raspberry Pi 5 8GB / Windows: 1~5단계 통합 실행 (5단계 담당: 결과 처리 + 통합).
 # 1~4단계와 단일 카메라 동작 검사는 같은 폴더 stages/의 모듈을 쓰고,
 # 결과는 5-result.py로 처리한다. 임시통합 폴더가 없어도 5-result 폴더만으로 동작한다.
-#   1단계 standby.FaceWatcher      : 320×180 / 5fps 절전 검사, 위치·정면·크기·0.8초 유지
+#   1단계 standby.FaceWatcher      : FHD 카메라에서 320×180 / 5fps 검사, 위치·정면·크기·0.8초 유지
 #   2단계 detection.detect_faces   : 640×480 활성 모드 YuNet 검출, 원본 좌표 박스 + 특징점 5개
 #   3단계 face_core.FaceEngine     : 특징점 정렬 + SFace 128차원 임베딩
 #   4단계 authenticate_face        : 등록 사용자(stages/data/faces.sqlite3)와 코사인 유사도 비교 -> (이름|None, 점수)
@@ -58,37 +58,38 @@ class Stages:
             import face_core
             import models
             import pipeline
+            import enrollment
         except ImportError as exc:
             raise RuntimeError(f'1~4단계 모듈을 불러올 수 없습니다 ({exc}). 5-result/setup.bat을 먼저 실행하세요.') from exc
         self.cv2, self.capture_control, self.database = cv2, capture_control, database
         self.face_core, self.pipeline_module = face_core, pipeline
+        self.enrollment_module = enrollment
         paths = models.ensure_models(lambda text: print(f'  {text}', file=sys.stderr))
         self.engine = face_core.FaceEngine(*paths)
         self.store = database.initialize_database()
         self.threshold = face_core.DEFAULT_THRESHOLD if threshold is None else threshold
+        self.adaptive_front = threshold is None
 
     def new_pipeline(self, source, purpose="authenticate", enrollment_name=None):
+        if purpose == 'enroll':
+            return self.enrollment_module.EnrollmentPipeline(self.engine, enrollment_name,
+                                                            store=self.store, threshold=self.threshold, source=source)
         # The legacy interval argument remains compatible; a successful auth pair is stored atomically.
         return self.pipeline_module.FacePipeline(self.engine, store=self.store, source=source,
                                                  save_interval=1.0, threshold=self.threshold, purpose=purpose,
-                                                 enrollment_name=enrollment_name)
+                                                 enrollment_name=enrollment_name, adaptive_front=self.adaptive_front)
 
 
 class Camera:
-    """임시통합 app.py와 같은 방식: 절전/활성 해상도 전환, 소프트웨어로 정확한 분석 해상도 맞춤."""
-    def __init__(self, stages, index, flip=True, profile=None):
+    """Keep the camera at FHD and resize only the frames passed to the current pipeline."""
+    def __init__(self, stages, index, flip=True):
         self.stages, self.flip = stages, flip
         self.cv2, self.control = stages.cv2, stages.capture_control
-        self.profile = profile or self.control.STANDBY_PROFILE
-        self.capture = stages.face_core.open_camera(index, size=self.profile.size, fps=self.profile.fps)
+        self.capture = stages.face_core.open_camera(index, size=self.control.CAMERA_SIZE, fps=self.control.CAMERA_FPS)
         self.failures = 0
         self.resolution_gate = self.control.EnrollmentResolutionGate()
 
     def read(self, profile):
-        if profile != self.profile:
-            self.control.configure_capture(self.capture, profile.size, profile.fps)
-            self.profile = profile
-            self.resolution_gate.reset()
         ok, frame = self.capture.read()
         if not ok or frame is None:
             self.failures += 1
@@ -96,7 +97,7 @@ class Camera:
                 raise RuntimeError('카메라 영상이 끊겼습니다. 다른 앱의 카메라 사용 여부를 확인하세요.')
             return None
         self.failures = 0
-        if not self.resolution_gate.accept(frame, profile):
+        if not self.resolution_gate.accept(frame, self.control.STANDBY_PROFILE):
             return None
         if self.flip:
             frame = self.cv2.flip(frame, 1)
@@ -130,6 +131,9 @@ class Preview:
     def show(self, frame, result, banner=None, color=None, wait_ms=1):
         cv2 = self.cv2
         image = frame.copy()
+        if result.mesh_landmarks is not None:
+            from face_grid import draw_mesh_preview
+            draw_mesh_preview(image, result.mesh_landmarks)
         boxes = [face.box for face in result.faces] or (result.detection_boxes or [])
         box_color = color or ((0, 255, 255) if result.ready else (0, 165, 255) if boxes else (200, 200, 200))
         for x, y, w, h in boxes:
@@ -138,9 +142,15 @@ class Preview:
         cv2.rectangle(image, (0, 0), (image.shape[1], 24), (0, 0, 0), -1)
         cv2.putText(image, text, (5, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1, cv2.LINE_AA)
         direction = getattr(result, 'direction', None)
+        if result.purpose == 'authenticate' or (result.purpose == 'enroll' and direction):
+            from enrollment import FACE_GUIDE_RADII
+            height, width = image.shape[:2]
+            rx, ry = FACE_GUIDE_RADII
+            cv2.ellipse(image, (width//2, height//2), (round(rx*width), round(ry*height)),
+                        0, 0, 360, (213, 225, 84), 3, cv2.LINE_AA)
         if direction:
             cx = image.shape[1] // 2
-            offsets = {'up': (0, -25), 'down': (0, 25), 'left': (-25, 0), 'right': (25, 0)}
+            offsets = {'up': (0, -25), 'left': (-25, 0), 'right': (25, 0)}
             cv2.rectangle(image, (cx-80, 30), (cx+80, 130), (0, 0, 0), -1)
             if direction in offsets:
                 dx, dy = offsets[direction]
@@ -148,11 +158,26 @@ class Preview:
             else:
                 cv2.circle(image, (cx, 75), 15, (0, 255, 255), 3)
             cv2.putText(image, direction.upper(), (cx-35, 120), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1)
+        hint = {
+            'raise_chin': 'Raise your chin slightly',
+            'lower_chin': 'Lower your chin slightly',
+            'turn_left': 'Turn slightly toward screen left',
+            'turn_right': 'Turn slightly toward screen right',
+            'level_head': 'Bring your head upright',
+        }.get(result.pose_hint)
+        if hint and result.purpose == 'authenticate' and not result.authentication_attempted:
+            font, scale = cv2.FONT_HERSHEY_SIMPLEX, max(.6, image.shape[1]/960)
+            (width, height), _ = cv2.getTextSize(hint, font, scale, 2)
+            x, y = (image.shape[1]-width)//2, image.shape[0]-34
+            cv2.rectangle(image, (x-15, y-height-10), (x+width+15, y+10), (20, 16, 14), -1)
+            cv2.putText(image, hint, (x, y), font, scale, (199, 243, 254), 2, cv2.LINE_AA)
         cv2.imshow(self.WINDOW, image)
-        if cv2.waitKey(wait_ms) & 0xFF in (27, ord('q'), ord('Q')):
+        key = cv2.waitKey(wait_ms) & 0xFF
+        if key in (27, ord('q'), ord('Q')):
             raise KeyboardInterrupt
         if cv2.getWindowProperty(self.WINDOW, cv2.WND_PROP_VISIBLE) < 1:
             raise KeyboardInterrupt
+        return key
 
     def pump(self):
         # 창 이벤트만 처리(5단계 처리 중에는 ESC로 끊지 않음 - 문 열림·잠금 처리를 끝까지 마침)
@@ -299,17 +324,17 @@ def cmd_run(args):
 
 
 def cmd_enroll(args):
-    # The worker/pipeline owns all 15 snapshots and commits a complete profile atomically.
+    # The worker/pipeline owns all 12 snapshots and commits a complete profile atomically.
     stages = Stages(args.threshold)
     target = stages.face_core.REGISTRATION_SAMPLES
     camera = preview = pipeline = None
     last_status = None
+    last_manual_status = None
     try:
-        camera = Camera(stages, args.camera, flip=not args.no_flip,
-                        profile=stages.capture_control.ENROLLMENT_PROFILE)
+        camera = Camera(stages, args.camera, flip=not args.no_flip)
         pipeline = stages.new_pipeline(f'camera:{args.camera}', purpose='enroll', enrollment_name=args.name)
-        preview = Preview(stages.cv2) if args.show else None
-        print(f'등록: {args.name} - 정면·상·하·좌·우마다 3장씩, 총 {target}장',
+        preview = Preview(stages.cv2)
+        print(f'등록: {args.name} - 정면·위·좌·우마다 3장씩, 총 {target}장 · 가이드에 맞추고 P 키로 촬영',
               file=sys.stderr, flush=True)
         while True:
             started = time.monotonic()
@@ -319,6 +344,9 @@ def cmd_enroll(args):
                 time.sleep(0.05)
                 continue
             result = pipeline.process(frame)
+            if result.manual_capture_status and result.manual_capture_status != last_manual_status:
+                print(f'  {result.manual_capture_status}', file=sys.stderr, flush=True)
+                last_manual_status = result.manual_capture_status
             status = result.status
             kind = re.sub(r'[\d.]+/[\d.]+초', '', status)  # 유지 시간 숫자만 바뀌면 다시 출력 안 함
             if kind != last_status:
@@ -328,8 +356,10 @@ def cmd_enroll(args):
                 raise RuntimeError(result.enrollment_error)
             if result.enrollment_completed:
                 break
-            if preview is not None:
-                preview.show(frame, result, banner=f'ENROLL {result.enrollment_count}/{target}', color=(255, 0, 255))
+            key = preview.show(frame, result, banner=f'ENROLL {result.enrollment_count}/{target} | P: capture', color=(255, 0, 255))
+            if key in (ord('p'), ord('P')) and result.direction:
+                pipeline.request_manual_capture(pipeline.session_id, result.direction, result.enrollment_count,
+                                                time.monotonic())
             time.sleep(stages.capture_control.frame_delay(started, time.monotonic(), profile.fps))
     finally:
         with ExitStack() as cleanup:
@@ -365,7 +395,7 @@ def parser():
     run.add_argument('--no-gpio', action='store_true', help='GPIO 장치 생성 안 함(노트북)')
     run.add_argument('--no-voice', action='store_true', help='음성 안내 끔')
     run.add_argument('--departure', type=float, default=1.0, help='다음 사람 대기 전 화면 비움 시간(초)')
-    enroll = commands.add_parser('enroll', help='정면·상·하·좌·우 3장씩 사진·Mesh·임베딩 등록')
+    enroll = commands.add_parser('enroll', help='미리보기에서 P로 정면·위·좌·우 3장씩 등록')
     enroll.add_argument('--name', required=True)
     commands.add_parser('users', help='등록 목록')
     delete = commands.add_parser('delete', help='등록 삭제')

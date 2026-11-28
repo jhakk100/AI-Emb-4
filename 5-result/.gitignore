@@ -1,6 +1,8 @@
-# 보안 로그·얼굴 사진·등록 DB는 개인정보라 깃에 올리지 않음
+# 실행 중 생성된 로그와 DB. 팀 테스트용 고정 스냅샷은 team-test에 별도로 보관.
 logs/
 stages/data/
+team-test/*.sqlite3-*
+pose_calibration.json
 # 가상환경, 캐시, 다운로드 모델(setup.bat이 받음)
 .venv/
 __pycache__/
